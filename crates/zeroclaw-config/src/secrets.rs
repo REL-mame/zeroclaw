@@ -689,6 +689,10 @@ where
     // is already set via mode(0o600) at open time).
     #[cfg(unix)]
     {
+        // Sync temp directory entry before hard_link — crash between
+        // data sync and hard_link can orphan the inode.
+        sync_parent_dir(&temp_path)?;
+
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600));
     }
@@ -711,20 +715,25 @@ where
             }
             Err(e) => return Err(e).context("Failed to atomically publish key file"),
         }
+        // Sync the parent directory before removing the temp name — the
+        // hard_link entry must be crash-durable before the temp inode's
+        // last remaining name is destroyed.
+        sync_parent_dir(key_path)?;
         // Remove the temp *name* (inode survives via the key_path link).
-        // Only disarm when removal succeeds — if it fails (permissions,
-        // anti-virus, stale NFS handle), the guard stays armed so Drop
-        // retries cleanup rather than leaving a second key-bearing name.
+        // Only disarm when removal succeeds — if it fails, the guard stays
+        // armed so Drop retries cleanup.
         if std::fs::remove_file(&temp_path).is_ok() {
             temp_guard.disarm();
+            // Sync so the temp-name removal is also crash-durable.
+            sync_parent_dir(key_path)?;
         }
-        // Sync parent dir so the new directory entry is crash-durable.
-        sync_parent_dir(key_path)?;
     }
 
-    // Windows: MoveFileExW(temp, final, 0) — atomic rename WITHOUT
-    // MOVEFILE_REPLACE_EXISTING.  Fails with ERROR_ALREADY_EXISTS if final
-    // exists.  Universal across NTFS/ReFS/SMB/FAT — no hard-link fallback.
+    // Windows: MoveFileExW(temp, final, MOVEFILE_WRITE_THROUGH) — atomic
+    // rename WITHOUT MOVEFILE_REPLACE_EXISTING.  Fails with
+    // ERROR_ALREADY_EXISTS if final exists.  MOVEFILE_WRITE_THROUGH makes
+    // the rename itself crash-durable (the call does not return until the
+    // metadata is flushed), so no separate directory sync is needed.
     #[cfg(windows)]
     {
         match move_file_no_replace(&temp_path, key_path) {
@@ -737,19 +746,18 @@ where
             }
             Err(e) => return Err(e).context("Failed to atomically publish key file"),
         }
-        // Sync parent dir so the renamed entry is crash-durable.
-        sync_parent_dir(key_path)?;
     }
 
     Ok(())
 }
 
-/// Sync the parent directory so the new directory entry is crash-durable.
-/// `sync_all()` on a directory fd calls `fsync` (Unix) or `FlushFileBuffers`
-/// (Windows); both flush the directory metadata to the underlying volume.
+/// Sync the parent directory so the new name is crash-durable.
+#[cfg(unix)]
 fn sync_parent_dir(file_path: &Path) -> Result<()> {
     if let Some(parent) = file_path.parent() {
-        std::fs::File::open(parent)
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(parent)
             .and_then(|d| d.sync_all())
             .with_context(|| {
                 format!(
@@ -761,7 +769,9 @@ fn sync_parent_dir(file_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `MoveFileExW(src, dst, 0)` — atomic rename WITHOUT `MOVEFILE_REPLACE_EXISTING`.
+/// `MoveFileExW(src, dst, MOVEFILE_WRITE_THROUGH)` — atomic rename WITHOUT
+/// `MOVEFILE_REPLACE_EXISTING`.  `MOVEFILE_WRITE_THROUGH` makes the rename
+/// crash-durable: the call does not return until the metadata is flushed.
 ///
 /// `dst` existing → `GetLastError()` = `ERROR_ALREADY_EXISTS` (183) → std maps to
 /// `io::ErrorKind::AlreadyExists`, preserving create-if-absent.  Universal across
@@ -772,7 +782,9 @@ fn sync_parent_dir(file_path: &Path) -> Result<()> {
 #[cfg(windows)]
 fn move_file_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
+    use windows::Win32::Storage::FileSystem::{
+        MOVE_FILE_FLAGS, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
     use windows::core::PCWSTR;
 
     // NUL-terminated wide strings for the Win32 W API.  Keep the buffers alive
@@ -788,12 +800,11 @@ fn move_file_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
         .chain(std::iter::once(0))
         .collect();
 
-    // dwFlags = 0 → no MOVEFILE_REPLACE_EXISTING → fails if dst already exists.
     let result = unsafe {
         MoveFileExW(
             PCWSTR(src_w.as_ptr()),
             PCWSTR(dst_w.as_ptr()),
-            MOVE_FILE_FLAGS(0),
+            MOVE_FILE_FLAGS(MOVEFILE_WRITE_THROUGH.0),
         )
     };
 
@@ -2013,6 +2024,7 @@ exit 65
 
     // Smoke-test: sync_parent_dir on a live key file must not error.
     #[test]
+    #[cfg(unix)]
     fn sync_parent_dir_smoke() {
         let tmp = TempDir::new().unwrap();
         let key_path = tmp.path().join(".secret_key");
