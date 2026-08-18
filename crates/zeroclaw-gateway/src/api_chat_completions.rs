@@ -8,6 +8,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
+use zeroclaw_config::schema::Config;
 
 // ── Request wire types ──────────────────────────────────────────────────────
 
@@ -471,6 +472,87 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
     Ok(())
 }
 
+// ── Agent routing (model → alias) ───────────────────────────────────────────
+
+/// Map an OpenAI `model` value to a ZeroClaw agent alias.
+///
+/// - `""` / `zeroclaw` / `zeroclaw/default` → `resolved_runtime_agent_alias()`
+///   (the same default-agent semantics webhook chat uses);
+/// - `zeroclaw/<alias>` → `alias` — only this prefix is recognized
+///   (`zeroclaw:`/`agent:` are not part of the contract); existence of the
+///   alias is verified by the caller;
+/// - anything else → `Err` (fail closed, no silent routing).
+///
+/// Only the string mapping happens here; alias existence is a handler-side
+/// concern so the two failure modes stay distinguishable.
+/// `#[allow(dead_code)]` until the chat-completions handler consumes it.
+#[allow(dead_code)]
+fn agent_alias_from_model(model: &str, config: &Config) -> Result<String, String> {
+    let model = model.trim();
+
+    // ① default shorthand: empty / zeroclaw / zeroclaw/default
+    if model.is_empty() || model == "zeroclaw" || model == "zeroclaw/default" {
+        return config
+            .resolved_runtime_agent_alias()
+            .map(str::to_owned)
+            .ok_or_else(|| "no enabled [agents.<alias>] configured".to_string());
+    }
+
+    // ② single prefix: zeroclaw/<alias>
+    if let Some(rest) = model.strip_prefix("zeroclaw/") {
+        let alias = rest.trim();
+        if alias.is_empty() {
+            return Err(format!(
+                "Invalid agent target `{model}`: missing agent alias"
+            ));
+        }
+        return Ok(alias.to_string());
+    }
+
+    // ③ everything else is rejected
+    Err(format!(
+        "Unrecognized model `{model}`: this endpoint routes to ZeroClaw agents only. \
+         Use `zeroclaw/<agent-alias>`, or omit `model` (or send `zeroclaw`) for the \
+         default agent. Provider and model are ZeroClaw configuration, not per-request."
+    ))
+}
+
+/// Resolve `model` to an agent alias and verify it exists, folding both
+/// failures into the 400 `invalid_request_error` envelope the handler returns.
+/// Explicitly *not* checking `enabled`: an alias that exists but is disabled
+/// is still reachable when named directly (same as WS `?agent=`).
+/// `#[allow(dead_code)]` until the chat-completions handler consumes it; the
+/// `Err` Response is the handler's return type (same shape as `validate_request`).
+#[allow(dead_code, clippy::result_large_err)]
+pub(crate) fn resolve_agent_alias_from_model(
+    model: &str,
+    config: &Config,
+) -> Result<String, Response> {
+    let alias = match agent_alias_from_model(model, config) {
+        Ok(alias) => alias,
+        Err(e) => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &e,
+                None,
+                Some("model"),
+            ));
+        }
+    };
+
+    if config.agent(&alias).is_none() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("Unknown agent `{alias}` — no [agents.{alias}] entry configured."),
+            None,
+            Some("model"),
+        ));
+    }
+    Ok(alias)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -874,5 +956,127 @@ mod tests {
         assert_eq!(r.metadata.as_ref().unwrap()["k"], "v");
         // store is Option<bool>: explicit false is distinct from unset (None).
         assert_eq!(r.store, Some(false));
+    }
+
+    // ── Model → agent routing ─────────────────────────────────────────────
+
+    use zeroclaw_config::schema::AliasedAgentConfig;
+
+    fn config_with_agents(agents: &[(&str, bool)]) -> Config {
+        let mut config = Config::default();
+        for (alias, enabled) in agents {
+            config.agents.insert(
+                (*alias).to_string(),
+                AliasedAgentConfig {
+                    enabled: *enabled,
+                    ..Default::default()
+                },
+            );
+        }
+        config
+    }
+
+    #[test]
+    fn default_shorthand_routes_to_default_agent() {
+        let config = config_with_agents(&[("default", true)]);
+        assert_eq!(agent_alias_from_model("", &config), Ok("default".to_string()));
+        assert_eq!(
+            agent_alias_from_model("zeroclaw", &config),
+            Ok("default".to_string())
+        );
+        assert_eq!(
+            agent_alias_from_model("zeroclaw/default", &config),
+            Ok("default".to_string())
+        );
+        assert_eq!(
+            agent_alias_from_model("  zeroclaw  ", &config),
+            Ok("default".to_string()),
+            "model is trimmed before matching"
+        );
+    }
+
+    #[test]
+    fn default_falls_back_to_lexicographically_smallest_enabled() {
+        // No `default` key: empty model resolves via the runtime fallback —
+        // lexicographically smallest *enabled* agent (same as webhook chat).
+        let config = config_with_agents(&[("research", true), ("coding", true)]);
+        assert_eq!(agent_alias_from_model("", &config), Ok("coding".to_string()));
+    }
+
+    #[test]
+    fn default_no_enabled_agent_is_error() {
+        let config = config_with_agents(&[("research", false)]);
+        let err = agent_alias_from_model("", &config).unwrap_err();
+        assert!(err.contains("no enabled"), "err = {err}");
+    }
+
+    #[test]
+    fn explicit_alias_strips_prefix() {
+        let config = config_with_agents(&[("coding", true)]);
+        assert_eq!(
+            agent_alias_from_model("zeroclaw/coding", &config),
+            Ok("coding".to_string())
+        );
+        assert_eq!(
+            agent_alias_from_model("zeroclaw/coding ", &config),
+            Ok("coding".to_string()),
+            "alias is trimmed after the prefix"
+        );
+    }
+
+    #[test]
+    fn rejects_non_zeroclaw_prefixes() {
+        let config = config_with_agents(&[("coding", true)]);
+        for model in ["gpt-4", "zeroclaw:coding", "agent:coding"] {
+            let err = agent_alias_from_model(model, &config).unwrap_err();
+            assert!(
+                err.contains("routes to ZeroClaw agents only"),
+                "{model} should be rejected, err = {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_explicit_alias() {
+        let config = config_with_agents(&[("coding", true)]);
+        for model in ["zeroclaw/", "zeroclaw/   "] {
+            let err = agent_alias_from_model(model, &config).unwrap_err();
+            assert!(err.contains("missing agent alias"), "{model:?} err = {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_alias_400_in_handler() {
+        let config = config_with_agents(&[("coding", true)]);
+        let err = resolve_agent_alias_from_model("zeroclaw/nope", &config).unwrap_err();
+        let (status, body) = response_json(err).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "model");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown agent `nope`"));
+    }
+
+    #[test]
+    fn disabled_agent_not_rejected() {
+        // ① Explicit alias pointing at a disabled agent resolves fine —
+        // existence is the only gate, matching WS `?agent=`.
+        let config = config_with_agents(&[("coding", true), ("research", false)]);
+        assert_eq!(
+            agent_alias_from_model("zeroclaw/research", &config),
+            Ok("research".to_string())
+        );
+        assert_eq!(
+            resolve_agent_alias_from_model("zeroclaw/research", &config).unwrap(),
+            "research"
+        );
+
+        // ② `default` key present but disabled still wins the empty-model
+        // resolution (resolved_runtime_agent_alias prefers the literal
+        // `default` key without an enabled check — inherited master behaviour).
+        let config = config_with_agents(&[("default", false), ("coding", true)]);
+        assert_eq!(agent_alias_from_model("", &config), Ok("default".to_string()));
     }
 }
