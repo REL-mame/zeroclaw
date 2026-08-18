@@ -11,6 +11,7 @@ pub mod agent_owned_state;
 pub mod api;
 pub mod api_browse;
 pub mod api_config;
+pub mod api_chat_completions;
 pub mod api_logs;
 pub mod api_pairing;
 pub mod api_personality;
