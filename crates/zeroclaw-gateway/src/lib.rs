@@ -230,6 +230,19 @@ fn hash_webhook_secret(value: &str) -> String {
 /// How often the rate limiter sweeps stale IP entries from its map.
 const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
 
+/// Sliding-window decision carrying the real state, so callers can emit
+/// `x-ratelimit-*` / `Retry-After` from actual window math rather than
+/// fabricated constants.
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitDecision {
+    pub allowed: bool,
+    pub limit: u32,
+    pub remaining: u32,
+    /// Seconds until the oldest in-window request ages out and frees a slot.
+    /// Convert to an absolute reset time with `Utc::now() + reset_after_secs`.
+    pub reset_after_secs: u64,
+}
+
 #[derive(Debug)]
 struct SlidingWindowRateLimiter {
     limit_per_window: u32,
@@ -256,8 +269,24 @@ impl SlidingWindowRateLimiter {
     }
 
     fn allow(&self, key: &str) -> bool {
+        self.decide(key).allowed
+    }
+
+    /// Sliding-window decision. All math happens under the lock so
+    /// `remaining`/`reset_after_secs` are consistent with the recorded state.
+    /// - `limit_per_window == 0` → always allowed, `limit/remaining/reset` = 0;
+    /// - blocked → `allowed: false`, `remaining: 0`, `reset_after_secs` = time
+    ///   until the oldest in-window request ages out;
+    /// - allowed → `remaining = limit - entry.len()` (after push), `reset_after_secs`
+    ///   as above.
+    fn decide(&self, key: &str) -> RateLimitDecision {
         if self.limit_per_window == 0 {
-            return true;
+            return RateLimitDecision {
+                allowed: true,
+                limit: 0,
+                remaining: 0,
+                reset_after_secs: 0,
+            };
         }
 
         let now = Instant::now();
@@ -291,12 +320,30 @@ impl SlidingWindowRateLimiter {
         let entry = requests.entry(key.to_owned()).or_default();
         entry.retain(|instant| *instant > cutoff);
 
+        // reset_after_secs：最早 in-window 请求 age-out 还需的秒数。entry 内 instant 均
+        // <= now（都是过去的 push），`now.duration_since(*oldest)` 恒合法；窗口内已空则整窗重置。
+        let reset_after_secs = entry
+            .first()
+            .map(|oldest| self.window.saturating_sub(now.duration_since(*oldest)))
+            .unwrap_or(self.window)
+            .as_secs();
+
         if entry.len() >= self.limit_per_window as usize {
-            return false;
+            return RateLimitDecision {
+                allowed: false,
+                limit: self.limit_per_window,
+                remaining: 0,
+                reset_after_secs,
+            };
         }
 
         entry.push(now);
-        true
+        RateLimitDecision {
+            allowed: true,
+            limit: self.limit_per_window,
+            remaining: self.limit_per_window.saturating_sub(entry.len() as u32),
+            reset_after_secs,
+        }
     }
 }
 
@@ -304,14 +351,21 @@ impl SlidingWindowRateLimiter {
 pub struct GatewayRateLimiter {
     pair: SlidingWindowRateLimiter,
     webhook: SlidingWindowRateLimiter,
+    chat: SlidingWindowRateLimiter,
 }
 
 impl GatewayRateLimiter {
-    pub fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
+    pub fn new(
+        pair_per_minute: u32,
+        webhook_per_minute: u32,
+        chat_per_minute: u32,
+        max_keys: usize,
+    ) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
             webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
+            chat: SlidingWindowRateLimiter::new(chat_per_minute, window, max_keys),
         }
     }
 
@@ -321,6 +375,14 @@ impl GatewayRateLimiter {
 
     fn allow_webhook(&self, key: &str) -> bool {
         self.webhook.allow(key)
+    }
+
+    fn allow_chat(&self, key: &str) -> bool {
+        self.chat.allow(key)
+    }
+
+    fn decide_chat(&self, key: &str) -> RateLimitDecision {
+        self.chat.decide(key)
     }
 }
 
@@ -553,6 +615,13 @@ pub struct AppState {
     pub cancel_tokens: Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
     >,
+    /// Per-session WebSocket connection lease for cross-transport exclusion.
+    /// Key = raw session_key (e.g. `gw_<id>`), value = active connection count.
+    /// A session is "owned" by at least one live WS connection while count > 0;
+    /// HTTP chat refuses (409) while the lease is held.
+    pub ws_connections: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    >,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.
@@ -562,6 +631,43 @@ pub struct AppState {
     pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     /// Shared SOP audit logger from the daemon (for WS agent sessions).
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+}
+
+impl AppState {
+    /// Chat-completions rate-limit boolean: handler needs only "allow or not".
+    /// Key derivation matches pair/webhook (`client_key_from_request`).
+    pub fn check_chat_rate_limit(
+        &self,
+        peer_addr: Option<SocketAddr>,
+        headers: &HeaderMap,
+    ) -> bool {
+        let key = client_key_from_request(peer_addr, headers, self.trust_forwarded_headers);
+        self.rate_limiter.allow_chat(&key)
+    }
+
+    /// Full sliding-window decision for chat completions, so the handler can
+    /// emit real `x-ratelimit-limit`/`remaining`/`reset` (not fabricated
+    /// constants) on 429.
+    pub fn decide_chat_rate_limit(
+        &self,
+        peer_addr: Option<SocketAddr>,
+        headers: &HeaderMap,
+    ) -> RateLimitDecision {
+        let key = client_key_from_request(peer_addr, headers, self.trust_forwarded_headers);
+        self.rate_limiter.decide_chat(&key)
+    }
+}
+
+/// Whether the session is currently held by at least one live WebSocket
+/// connection. Call after `session_queue.acquire` so the turn-level queue has
+/// already serialized in-flight turns; the lease check then answers "is the
+/// WS connection still alive" with the smallest TOCTOU window.
+pub fn ws_session_active(state: &AppState, session_key: &str) -> bool {
+    state
+        .ws_connections
+        .lock()
+        .expect("ws_connections lock poisoned")
+        .contains_key(session_key)
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -1250,6 +1356,7 @@ pub async fn run_gateway(
     let rate_limiter = Arc::new(GatewayRateLimiter::new(
         config.gateway.pair_rate_limit_per_minute,
         config.gateway.webhook_rate_limit_per_minute,
+        config.gateway.chat_rate_limit_per_minute,
         rate_limit_max_keys,
     ));
     let idempotency_max_keys = normalize_max_keys(
@@ -1577,6 +1684,7 @@ pub async fn run_gateway(
         web_dist_dir,
         canvas_store,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
         sop_engine,
@@ -4371,7 +4479,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -4408,6 +4516,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5159,7 +5268,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5196,6 +5305,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5246,7 +5356,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5283,6 +5393,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5301,7 +5412,7 @@ mod tests {
 
     #[test]
     fn gateway_rate_limiter_blocks_after_limit() {
-        let limiter = GatewayRateLimiter::new(2, 2, 100);
+        let limiter = GatewayRateLimiter::new(2, 2, 2, 100);
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(!limiter.allow_pair("127.0.0.1"));
@@ -5920,7 +6031,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5957,6 +6068,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6025,7 +6137,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6062,6 +6174,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6145,7 +6258,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6182,6 +6295,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6245,7 +6359,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6282,6 +6396,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6364,7 +6479,7 @@ mod tests {
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6401,6 +6516,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6449,7 +6565,7 @@ mod tests {
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6486,6 +6602,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6539,7 +6656,7 @@ mod tests {
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6576,6 +6693,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6636,7 +6754,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6673,6 +6791,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6731,7 +6850,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6766,6 +6885,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6882,7 +7002,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6928,6 +7048,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "webauthn")]
@@ -7279,7 +7400,7 @@ mod tests {
 
     #[test]
     fn gateway_rate_limiter_pair_and_webhook_are_independent() {
-        let limiter = GatewayRateLimiter::new(2, 3, 100);
+        let limiter = GatewayRateLimiter::new(2, 3, 100, 100);
 
         // Exhaust pair limit
         assert!(limiter.allow_pair("ip-1"));
@@ -7291,6 +7412,96 @@ mod tests {
         assert!(limiter.allow_webhook("ip-1"));
         assert!(limiter.allow_webhook("ip-1"));
         assert!(!limiter.allow_webhook("ip-1")); // webhook now blocked
+    }
+
+    #[test]
+    fn decide_reports_remaining_and_reset() {
+        let limiter = SlidingWindowRateLimiter::new(3, Duration::from_secs(60), 100);
+
+        let d1 = limiter.decide("k");
+        assert!(d1.allowed);
+        assert_eq!(d1.limit, 3);
+        assert_eq!(d1.remaining, 2);
+
+        let d2 = limiter.decide("k");
+        assert!(d2.allowed);
+        assert_eq!(d2.remaining, 1);
+
+        let d3 = limiter.decide("k");
+        assert!(d3.allowed);
+        assert_eq!(d3.remaining, 0);
+
+        // Window exhausted: blocked with the oldest in-window request's
+        // age-out time as reset_after_secs (> 0 until the window ages out).
+        let d4 = limiter.decide("k");
+        assert!(!d4.allowed);
+        assert_eq!(d4.limit, 3);
+        assert_eq!(d4.remaining, 0);
+        assert!(d4.reset_after_secs > 0);
+    }
+
+    #[test]
+    fn chat_rate_limit_zero_always_allows() {
+        // `chat_rate_limit_per_minute = 0` disables the chat bucket entirely:
+        // decide returns allowed with a zeroed decision.
+        let limiter = GatewayRateLimiter::new(1, 1, 0, 100);
+        for _ in 0..10 {
+            assert!(limiter.allow_chat("k"));
+        }
+        let d = limiter.decide_chat("k");
+        assert!(d.allowed);
+        assert_eq!(d.limit, 0);
+        assert_eq!(d.remaining, 0);
+        assert_eq!(d.reset_after_secs, 0);
+    }
+
+    #[test]
+    fn gateway_rate_limiter_four_params() {
+        // The chat bucket counts independently of pair/webhook.
+        let limiter = GatewayRateLimiter::new(1, 1, 2, 100);
+
+        assert!(limiter.allow_pair("k"));
+        assert!(!limiter.allow_pair("k")); // pair exhausted at 1
+
+        assert!(limiter.allow_webhook("k"));
+        assert!(!limiter.allow_webhook("k")); // webhook exhausted at 1
+
+        assert!(limiter.allow_chat("k"));
+        assert!(limiter.allow_chat("k"));
+        assert!(!limiter.allow_chat("k")); // chat exhausted at 2
+    }
+
+    #[test]
+    fn allow_pair_webhook_unchanged_after_decide() {
+        // `allow()` is now a thin wrapper over `decide().allowed`; pair/webhook
+        // thresholds and outcomes must be bit-identical to pre-decide behaviour.
+        let limiter = GatewayRateLimiter::new(2, 3, 100, 100);
+
+        // Pair: exhaust via the old bool path, then read the real decision.
+        assert!(limiter.allow_pair("ip-1"));
+        assert!(limiter.allow_pair("ip-1"));
+        assert!(!limiter.allow_pair("ip-1"));
+        let d = limiter.decide_chat("pair-probe"); // chat 档 100 恒放行，仅验证 decide 链路可用
+        assert!(d.allowed);
+
+        // Webhook: threshold unchanged (3 per window).
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(!limiter.allow_webhook("ip-1"));
+    }
+
+    #[test]
+    fn ws_session_active_true_when_ws_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+        state
+            .ws_connections
+            .lock()
+            .unwrap()
+            .insert("gw_x".to_string(), 1);
+        assert!(ws_session_active(&state, "gw_x"));
+        assert!(!ws_session_active(&state, "gw_y"));
     }
 
     #[test]
@@ -7735,7 +7946,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -7772,6 +7983,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7821,7 +8033,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -7858,6 +8070,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -8142,7 +8355,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -8179,6 +8392,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,

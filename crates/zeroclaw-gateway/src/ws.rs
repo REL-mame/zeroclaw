@@ -120,6 +120,48 @@ fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) ->
     None
 }
 
+/// Connection-scoped RAII lease over `AppState::ws_connections`: +1 on `new`,
+/// -1 (removing the key at 0) on `drop`. Held for the *whole* WS connection
+/// lifetime so the HTTP chat surface can 409 against cross-transport
+/// concurrency. Key = raw `session_key` (`gw_<id>`), no casing folding.
+struct WsConnectionGuard {
+    session_key: String,
+    ws_connections: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+}
+
+impl WsConnectionGuard {
+    fn new(
+        session_key: String,
+        ws_connections: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    ) -> Self {
+        ws_connections
+            .lock()
+            .expect("ws_connections lock poisoned")
+            .entry(session_key.clone())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        Self {
+            session_key,
+            ws_connections,
+        }
+    }
+}
+
+impl Drop for WsConnectionGuard {
+    fn drop(&mut self) {
+        let mut map = self
+            .ws_connections
+            .lock()
+            .expect("ws_connections lock poisoned");
+        if let Some(count) = map.get_mut(&self.session_key) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.session_key);
+            }
+        }
+    }
+}
+
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
@@ -181,19 +223,31 @@ pub async fn handle_ws_chat(
         }
     }
 
-    let session_id = params.session_id;
+    // Session key is resolved *before* the upgrade so the connection lease
+    // covers the whole WS lifetime: the guard is moved into the `on_upgrade`
+    // async block and lives until `handle_socket` returns, leaving no window
+    // between "upgrade accepted" and "first poll" where the lease is unheld.
+    // Semantics unchanged from master (provided id or fresh UUID; `gw_<id>`).
+    let session_id = params.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    let pre_ws_guard =
+        WsConnectionGuard::new(session_key.clone(), Arc::clone(&state.ws_connections));
+
     let session_name = params.name;
     let session_cwd = params.cwd.or(params.workspace_dir);
-    ws.on_upgrade(move |socket| {
+    ws.on_upgrade(move |socket| async move {
         handle_socket(
             socket,
             state,
             agent_alias,
             session_id,
+            session_key,
+            pre_ws_guard,
             session_name,
             session_cwd,
             auth_subject,
         )
+        .await
     })
     .into_response()
 }
@@ -338,7 +392,11 @@ async fn handle_socket(
     socket: WebSocket,
     state: AppState,
     agent_alias: String,
-    session_id: Option<String>,
+    session_id: String,
+    session_key: String,
+    // Connection-scoped lease: held via Drop for the whole WS lifetime so the
+    // HTTP chat surface can 409 against cross-transport concurrency.
+    _connection_guard: WsConnectionGuard,
     session_name: Option<String>,
     session_cwd: Option<String>,
     // The transport-authenticated approval subject (paired-token hash), if the
@@ -348,9 +406,6 @@ async fn handle_socket(
 ) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Resolve session ID: use provided or generate a new UUID
-    let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 
@@ -1340,6 +1395,52 @@ mod tests {
                 .unwrap_or_default()
                 .contains(diagnostic),
             "WebSocket delivery must not fall back to the diagnostic when Fluent supplies text"
+        );
+    }
+
+    #[test]
+    fn ws_guard_refcounts_and_drops_at_zero() {
+        let ws_connections = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let g1 = WsConnectionGuard::new("gw_x".into(), Arc::clone(&ws_connections));
+        let g2 = WsConnectionGuard::new("gw_x".into(), Arc::clone(&ws_connections));
+        {
+            let map = ws_connections.lock().unwrap();
+            assert_eq!(map.get("gw_x"), Some(&2));
+        }
+
+        drop(g1);
+        {
+            let map = ws_connections.lock().unwrap();
+            assert_eq!(map.get("gw_x"), Some(&1));
+        }
+
+        drop(g2);
+        {
+            let map = ws_connections.lock().unwrap();
+            assert!(
+                !map.contains_key("gw_x"),
+                "last guard drop must remove the key"
+            );
+        }
+    }
+
+    #[test]
+    fn ws_upgrade_failure_releases_pre_guard() {
+        // Upgrade-failure path: `on_upgrade` spawns an async block that owns
+        // the closure (with its moved-in pre-guard). If the handshake fails the
+        // block ends without polling handle_socket; dropping the closure must
+        // still release the lease.
+        let ws_connections = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        {
+            let _pre_ws_guard = WsConnectionGuard::new("gw_x".into(), Arc::clone(&ws_connections));
+            assert_eq!(ws_connections.lock().unwrap().get("gw_x"), Some(&1));
+            // Simulate the `Err(_)` branch: scope ends, the owning closure is
+            // dropped, no handle_socket runs.
+        }
+        assert!(
+            !ws_connections.lock().unwrap().contains_key("gw_x"),
+            "handshake failure must not leak the pre-registered lease"
         );
     }
 
