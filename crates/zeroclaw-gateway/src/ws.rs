@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
+use zeroclaw_runtime::agent::TurnEvent;
 use zeroclaw_runtime::sop::approval::{
     ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
 };
@@ -897,39 +898,6 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
     }
 }
 
-fn persist_conversation_messages(
-    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
-    session_key: &str,
-    messages: &[zeroclaw_providers::ConversationMessage],
-) {
-    // if the user deleted the session between the turn starting and
-    // the post-turn persistence, don't resurrect it. The `aborted` / `done`
-    // / `error` frames are still sent to the client; we just refuse to
-    // re-create the row that `DELETE /api/sessions/{id}` just wiped.
-    if !backend.session_exists(session_key) {
-        return;
-    }
-    for message in messages {
-        let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
-            continue;
-        };
-        if message.role == "system" {
-            continue;
-        }
-        let _ = backend.append(session_key, message);
-    }
-}
-
-fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessage]) -> bool {
-    messages.iter().any(|message| {
-        matches!(
-            message,
-            zeroclaw_providers::ConversationMessage::Chat(message)
-                if message.role == "assistant"
-        )
-    })
-}
-
 fn history_trimmed_ws_frame(
     dropped_messages: usize,
     kept_turns: usize,
@@ -983,8 +951,9 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
 }
 
 /// Process a single chat message through the agent and send the response.
-/// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
-/// and tool results are forwarded to the WebSocket client in real time.
+/// Delegates the turn lifecycle to [`run_gateway_turn`]; the transport
+/// supplies a `forward` closure that maps streamed turn events to WebSocket
+/// frames, handles steering/approval/ping, and returns usage observations.
 #[allow(clippy::too_many_arguments)]
 async fn process_chat_message(
     state: &AppState,
@@ -1002,114 +971,33 @@ async fn process_chat_message(
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
 ) {
+    use crate::turn_runner::{TurnForwardResult, TurnRunnerHandle, run_gateway_turn, TurnStatus};
     use futures_util::StreamExt as _;
-    use zeroclaw_runtime::agent::TurnEvent;
 
-    let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
-    let provider_label = turn_provider.clone();
-    let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
-        let config = state.config.read();
-        let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
-        zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
-            tracker.clone(),
-            Arc::new(pricing),
-        )
-        .with_agent_alias(&turn_alias)
-    });
-    let turn_usage = state.cost_tracker.as_ref().map(|_| {
-        Arc::new(parking_lot::Mutex::new(
-            zeroclaw_runtime::agent::cost::TurnUsage::default(),
-        ))
-    });
-
-    // Resolve context budget for this agent. Wire field is named
-    // `max_context_tokens` and must track the runtime-profile budget
-    // (same source Zerocode's context meter uses), not the provider
-    // model-window helper which falls back to 32_000 when unset.
-    let max_context_tokens = {
-        let cfg = state.config.read();
-        cfg.effective_max_context_tokens(&turn_alias) as u64
-    };
-
-    // Broadcast agent_start event
-    let _ = state.event_tx.send(serde_json::json!({
-        "type": "agent_start",
-        "model_provider": provider_label,
-        "model": turn_model,
-    }));
-
-    // Set session state to running
-    let turn_id = uuid::Uuid::new_v4().to_string();
-    if let Some(ref backend) = state.session_backend {
-        let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
-    }
-
-    // ── Cancellation token lifecycle ─────────────────────────────
-    // Create a token before the turn starts so the abort endpoint
-    // can cancel it. Remove it after the turn completes regardless
-    // of outcome (normal, error, or cancelled).
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .insert(session_key.to_string(), cancel_token.clone());
-    }
-
-    // Channel for streaming turn events from the agent.
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+    // WebSocket-only steering channel. The sender side is captured into the
+    // forward closure; the receiver side is lent to the runner, which only
+    // enters steering-drain mode when given a receiver.
     let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
 
-    let content_owned = content.to_string();
-    let session_key_owned = session_key.to_string();
-    let turn_fut = async {
-        use ::zeroclaw_log::Instrument as _;
-        let span = ::zeroclaw_log::info_span!(
-            target: "zeroclaw_log_internal_scope",
-            "zeroclaw_scope",
-            session_key = %session_key_owned,
-            agent_alias = %turn_alias,
-            model_provider = %turn_provider,
-            model = %turn_model,
-            channel = WS_CHANNEL_KEY,
-        );
-        zeroclaw_runtime::agent::loop_::scope_session_key(
-            Some(session_key_owned.clone()),
-            zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
-                turn_usage.clone(),
-                zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                    cost_tracking_context.clone(),
-                    agent
-                        .turn_streamed_with_steering_state(
-                            &content_owned,
-                            event_tx,
-                            Some(cancel_token.clone()),
-                            Some(&mut steering_rx),
-                        )
-                        .instrument(span),
-                ),
-            ),
-        )
-        .await
-    };
+    // Reborrow the sender so the terminal-frame assembly below can still use it
+    // after the forward closure (which owns a `&mut` into it) has been consumed.
+    let sender_fwd = &mut *sender;
 
-    // Drive both futures concurrently: the agent turn produces events
-    // and we relay them over WebSocket. Track streamed chunks so we
-    // can reconstruct partial content on cancellation.
-    let mut accumulated_text = String::new();
+    let forward = move |handle: TurnRunnerHandle| async move {
+        let TurnRunnerHandle {
+            mut event_rx,
+            cancel_token,
+        } = handle;
+        // Reconstruct partial content on cancellation by accumulating chunks.
+        let mut accumulated_text = String::new();
+        // Aggregate token usage across all LLM calls in this turn; the agent
+        // emits one Usage event per LLM call when the provider surfaces usage.
+        let mut total_input_tokens: Option<u64> = None;
+        let mut total_output_tokens: Option<u64> = None;
+        // Most recent absolute provider-reported prompt size (replaces on each
+        // Usage; not accumulated) for the client's context bar.
+        let mut last_input_tokens: Option<u64> = None;
 
-    // Aggregate token usage across all LLM calls in this turn.
-    // The agent emits TurnEvent::Usage once per LLM call when the provider
-    // surfaces usage; we sum to produce a single done-frame total.
-    let mut total_input_tokens: Option<u64> = None;
-    let mut total_output_tokens: Option<u64> = None;
-
-    // Track the most recent absolute provider-reported prompt size
-    // (replaces on each TurnEvent::Usage; not accumulated).
-    // Used for accurate context-bar rendering on the client.
-    let mut last_input_tokens: Option<u64> = None;
-    let forward_fut = async {
         let mut cancel_drained = false;
         loop {
             tokio::select! {
@@ -1127,7 +1015,7 @@ async fn process_chat_message(
                     let text = match client_msg {
                         Some(Ok(Message::Text(text))) => text,
                         Some(Ok(Message::Ping(payload))) => {
-                            if sender.send(Message::Pong(payload)).await.is_err() {
+                            if sender_fwd.send(Message::Pong(payload)).await.is_err() {
                                 cancel_token.cancel();
                                 break;
                             }
@@ -1146,7 +1034,7 @@ async fn process_chat_message(
                             "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
                             "code": "INVALID_JSON"
                         });
-                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        let _ = sender_fwd.send(Message::Text(err.to_string().into())).await;
                         continue;
                     };
                     match parsed["type"].as_str() {
@@ -1160,7 +1048,7 @@ async fn process_chat_message(
                                 state,
                                 session_id,
                                 auth_subject,
-                                &mut *sender,
+                                &mut *sender_fwd,
                             )
                             .await
                             {
@@ -1190,7 +1078,7 @@ async fn process_chat_message(
                                     "message": "Message content cannot be empty",
                                     "code": "EMPTY_CONTENT"
                                 });
-                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                let _ = sender_fwd.send(Message::Text(err.to_string().into())).await;
                                 continue;
                             }
                             match steering_tx.try_send(content) {
@@ -1201,7 +1089,7 @@ async fn process_chat_message(
                                         "message": "Steering queue is full for the running turn",
                                         "code": "STEERING_QUEUE_FULL"
                                     });
-                                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    let _ = sender_fwd.send(Message::Text(err.to_string().into())).await;
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                     let err = serde_json::json!({
@@ -1209,7 +1097,7 @@ async fn process_chat_message(
                                         "message": "Running turn is no longer accepting steering messages",
                                         "code": "STEERING_CLOSED"
                                     });
-                                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    let _ = sender_fwd.send(Message::Text(err.to_string().into())).await;
                                 }
                             }
                         }
@@ -1231,311 +1119,100 @@ async fn process_chat_message(
                             "arguments_summary": arguments_summary,
                             "timeout_secs": timeout_secs,
                         });
-                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                        let _ = sender_fwd.send(Message::Text(frame.to_string().into())).await;
                     }
                 }
                 _ = tick_websocket_ping(ping_interval) => {
-                    if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    if sender_fwd.send(Message::Ping(Vec::new().into())).await.is_err() {
                         cancel_token.cancel();
                         break;
                     }
                 }
-                    event_opt = event_rx.recv() => {
+                event_opt = event_rx.recv() => {
                     let Some(event) = event_opt else { break };
-                    let ws_msg = match event {
-                        TurnEvent::Usage {
-                            input_tokens,
-                            cached_input_tokens: _,
-                            output_tokens,
-                            cost_usd: _,
-                        } => {
-                            if let Some(it) = input_tokens {
-                                total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
-                                last_input_tokens = Some(it);
-                            }
-                            if let Some(ot) = output_tokens {
-                                total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
-                            }
-                            continue;
-                        }
-                        TurnEvent::Chunk { ref delta } => {
-                            accumulated_text.push_str(delta);
-                            serde_json::json!({ "type": "chunk", "content": delta })
-                        }
-                        TurnEvent::Thinking { delta } => {
-                            serde_json::json!({ "type": "thinking", "content": delta })
-                        }
-                        TurnEvent::ToolCall { id, name, args } => {
-                            serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
-                        }
-                        TurnEvent::ToolResult {
-                            id, name, output, ..
-                        } => {
-                            serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
-                        }
-                        TurnEvent::ApprovalRequest {
-                            request_id,
-                            tool_name,
-                            arguments_summary,
-                            timeout_secs,
-                        } => serde_json::json!({
-                            "type": "approval_request",
-                            "request_id": request_id,
-                            "tool": tool_name,
-                            "arguments_summary": arguments_summary,
-                            "timeout_secs": timeout_secs,
-                        }),
-                        TurnEvent::HistoryTrimmed {
-                            dropped_messages,
-                            kept_turns,
-                            reason,
-                        } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
-                        TurnEvent::Plan { entries } => serde_json::json!({
-                            "type": "plan",
-                            "entries": entries,
-                        }),
-                    };
-                    let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
-                }
-            }
-        }
-    };
-
-    let (result, ()) = tokio::join!(turn_fut, forward_fut);
-
-    // ── Remove cancel token (turn finished) ──────────────────────
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .remove(session_key);
-    }
-
-    // Check if this turn was cancelled. `turn_streamed` propagates
-    // `ToolLoopCancelled` through anyhow, so we detect it here.
-    let was_cancelled = match &result {
-        Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&e.error),
-        Ok(_) => false,
-    };
-
-    if was_cancelled {
-        if let Some(ref backend) = state.session_backend {
-            let still_exists = backend.session_exists(session_key);
-            if still_exists {
-                match &result {
-                    Err(error) if !error.new_messages.is_empty() => {
-                        persist_conversation_messages(
-                            backend.as_ref(),
-                            session_key,
-                            &error.new_messages,
-                        );
-                        if !has_assistant_chat_message(&error.new_messages) {
-                            let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                                "turn-interrupted-by-user",
-                            );
-                            let truncated = if accumulated_text.is_empty() {
-                                marker
-                            } else {
-                                format!("{accumulated_text}\n\n{marker}")
-                            };
-                            let assistant_msg =
-                                zeroclaw_providers::ChatMessage::assistant(&truncated);
-                            // Re-check before the raw append — the user can
-                            // delete the session between the outer check and
-                            // here; `persist_conversation_messages` already
-                            // re-checks internally.
-                            if backend.session_exists(session_key) {
-                                let _ = backend.append(session_key, &assistant_msg);
-                            }
-                        }
+                    if let TurnEvent::Chunk { delta } = &event {
+                        accumulated_text.push_str(delta);
                     }
-                    _ => {
-                        let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        );
-                        let truncated = if accumulated_text.is_empty() {
-                            marker
-                        } else {
-                            format!("{accumulated_text}\n\n{marker}")
-                        };
-                        let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-                        if backend.session_exists(session_key) {
-                            let _ = backend.append(session_key, &assistant_msg);
+                    if let TurnEvent::Usage {
+                        input_tokens,
+                        cached_input_tokens: _,
+                        output_tokens,
+                        cost_usd: _,
+                    } = &event {
+                        if let Some(it) = *input_tokens {
+                            total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
+                            last_input_tokens = Some(it);
                         }
+                        if let Some(ot) = *output_tokens {
+                            total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
+                        }
+                        continue;
+                    }
+                    if let Some(ws_msg) = turn_event_to_ws_frame(&event) {
+                        let _ = sender_fwd.send(Message::Text(ws_msg.to_string().into())).await;
                     }
                 }
             }
         }
-
-        // Inform the client the turn was aborted
-        let aborted = serde_json::json!({ "type": "aborted" });
-        let _ = sender.send(Message::Text(aborted.to_string().into())).await;
-
-        if let Some(ref backend) = state.session_backend
-            && backend.session_exists(session_key)
-        {
-            let _ = backend.set_session_state(session_key, "idle", None);
+        TurnForwardResult {
+            total_input_tokens,
+            total_output_tokens,
+            last_input_tokens,
+            accumulated_text,
         }
+    };
 
-        // Broadcast agent_end event
-        let _ = state.event_tx.send(serde_json::json!({
-            "type": "agent_end",
-            "model_provider": provider_label,
-            "model": turn_model,
-        }));
+    // The runner owns all state-level side effects (persistence, session state,
+    // consolidation, agent_start/agent_end, tracing, cancellation registration).
+    // WebSocket turns have no wall-clock timeout and always steer.
+    let outcome = run_gateway_turn(
+        state,
+        agent,
+        content,
+        session_key,
+        ws_memory,
+        Some(&mut steering_rx),
+        "wss",
+        None,
+        forward,
+    )
+    .await;
 
-        // Trace the cancelled turn so the doctor / replay tool sees it
-        // alongside successful turns.follow-through.
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "model_provider": provider_label,
-                    "model": turn_model,
-                    "session_key": session_key,
-                    "reason": "interrupted by user",
-                    "cancelled": true,
-                    "trace_id": turn_id,
-                })),
-            "gateway_ws_turn"
-        );
-
-        return;
-    }
-
-    match result {
-        Ok(outcome) => {
-            if let Some(ref backend) = state.session_backend {
-                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
-            }
-
-            // Fire-and-forget memory consolidation so facts from WS sessions
-            // are extracted to long-term memory (Daily + Core categories).
-            if state.auto_save {
-                if let Some(mem) = ws_memory.clone() {
-                    let model_provider = state.model_provider.clone();
-                    let model = state.model.clone();
-                    let temperature = state.temperature;
-                    let memory_config = state.config.read().memory.clone();
-                    let user_msg = content.to_string();
-                    let assistant_resp = outcome.response.clone();
-                    zeroclaw_spawn::spawn!(async move {
-                        if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                            model_provider.as_ref(),
-                            &model,
-                            temperature,
-                            mem.as_ref(),
-                            &memory_config,
-                            &user_msg,
-                            &assistant_resp,
-                        )
-                        .await
-                        {
-                            ::zeroclaw_log::record!(
-                                DEBUG,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                "WS memory consolidation skipped"
-                            );
-                        }
-                    });
-                } else {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        "WS memory consolidation skipped"
-                    );
-                }
-            }
-
-            let total_tokens = match (total_input_tokens, total_output_tokens) {
-                (Some(i), Some(o)) => Some(i.saturating_add(o)),
-                (Some(i), None) => Some(i),
-                (None, Some(o)) => Some(o),
-                (None, None) => None,
-            };
-            let cost_usd = turn_usage
-                .as_ref()
-                .map(|usage| *usage.lock())
-                .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
-                .map(|usage| usage.cost_usd);
-
+    // Terminal frame: exactly one done/aborted/error per turn.
+    match outcome.status {
+        TurnStatus::Success => {
             let done = serde_json::json!({
                 "type": "done",
-                "full_response": outcome.response,
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens,
-                "tokens_used": total_tokens,
-                "cost_usd": cost_usd,
-                "model": turn_model,
-                "provider": provider_label,
-                "max_context_tokens": max_context_tokens,
-                "last_input_tokens": last_input_tokens,
+                "full_response": outcome.response_text,
+                "input_tokens": outcome.total_input_tokens,
+                "output_tokens": outcome.total_output_tokens,
+                "tokens_used": outcome.total_tokens,
+                "cost_usd": outcome.cost_usd,
+                "model": outcome.model,
+                "provider": outcome.provider,
+                "max_context_tokens": outcome.max_context_tokens,
+                "last_input_tokens": outcome.last_input_tokens,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
-
-            // Set session state to idle
-            if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "idle", None);
-            }
-
-            // Broadcast agent_end event
-            let _ = state.event_tx.send(serde_json::json!({
-                "type": "agent_end",
-                "model_provider": provider_label,
-                "model": turn_model,
-            }));
-
-            // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
-            // sweep sees gateway WS turns alongside channel and CLI turns.
-            // Closes the gateway-side trace gap from
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({
-                        "model_provider": provider_label,
-                        "model": turn_model,
-                        "session_key": session_key,
-                        "input_tokens": total_input_tokens,
-                        "output_tokens": total_output_tokens,
-                        "tokens_used": total_tokens,
-                        "cost_usd": cost_usd,
-                        "last_input_tokens": last_input_tokens,
-                        "trace_id": turn_id,
-                    })),
-                "gateway_ws_turn"
-            );
         }
-        Err(e) => {
-            if let Some(ref backend) = state.session_backend
-                && !e.new_messages.is_empty()
-            {
-                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
-            }
-
-            // Set session state to error
-            if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
-            }
-
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e.error)})),
-                "Agent turn failed"
+        TurnStatus::Cancelled | TurnStatus::TimedOut => {
+            // WebSocket turns never time out (timeout is None); TimedOut is
+            // handled defensively like cancellation.
+            let aborted = serde_json::json!({ "type": "aborted" });
+            let _ = sender.send(Message::Text(aborted.to_string().into())).await;
+        }
+        TurnStatus::Error => {
+            let Some(failure) = outcome.error.as_ref() else {
+                return;
+            };
+            let err = ws_turn_failure_frame(
+                &failure.diagnostic,
+                failure.user_message.as_deref(),
+                failure.user_message.is_some(),
             );
-            let user_message =
-                zeroclaw_runtime::agent::terminal_completion_error_message(&e.error, None);
-            let err = send_ws_turn_failure(sender, &e.error, user_message.as_deref()).await;
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
 
-            // Broadcast error event
+            // Broadcast error event (WS-specific component identity).
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "error",
                 "component": "ws_chat",
@@ -1543,23 +1220,67 @@ async fn process_chat_message(
             }));
 
             // Trace the failed turn so the doctor / replay tool sees the
-            // failure mode and the turn_id can be cross-referenced with
-            // costs.jsonl.follow-through.
+            // failure mode and the turn_id can be cross-referenced with costs.
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
-                        "model_provider": provider_label,
-                        "model": turn_model,
+                        "model_provider": outcome.provider,
+                        "model": outcome.model,
                         "session_key": session_key,
-                        "error": zeroclaw_providers::sanitize_api_error(&e.error.to_string()),
+                        "error": zeroclaw_providers::sanitize_api_error(&failure.diagnostic),
                         "error_code": err["code"],
-                        "trace_id": turn_id,
+                        "trace_id": outcome.turn_id,
                     })),
                 "gateway_ws_turn"
             );
         }
+    }
+}
+
+
+/// Map a streamed turn event to its WebSocket frame. `Usage` events are never
+/// framed — the transport consumes them for token aggregation instead.
+fn turn_event_to_ws_frame(event: &TurnEvent) -> Option<serde_json::Value> {
+    match event {
+        TurnEvent::Usage { .. } => None,
+        TurnEvent::Chunk { delta } => {
+            Some(serde_json::json!({ "type": "chunk", "content": delta }))
+        }
+        TurnEvent::Thinking { delta } => {
+            Some(serde_json::json!({ "type": "thinking", "content": delta }))
+        }
+        TurnEvent::ToolCall { id, name, args } => {
+            Some(serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args }))
+        }
+        TurnEvent::ToolResult { id, name, output, .. } => Some(serde_json::json!({
+            "type": "tool_result",
+            "id": id,
+            "name": name,
+            "output": output
+        })),
+        TurnEvent::ApprovalRequest {
+            request_id,
+            tool_name,
+            arguments_summary,
+            timeout_secs,
+        } => Some(serde_json::json!({
+            "type": "approval_request",
+            "request_id": request_id,
+            "tool": tool_name,
+            "arguments_summary": arguments_summary,
+            "timeout_secs": timeout_secs,
+        })),
+        TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            reason,
+        } => Some(history_trimmed_ws_frame(*dropped_messages, *kept_turns, reason)),
+        TurnEvent::Plan { entries } => Some(serde_json::json!({
+            "type": "plan",
+            "entries": entries,
+        })),
     }
 }
 
@@ -1592,22 +1313,10 @@ fn ws_turn_failure_frame(
     })
 }
 
-async fn send_ws_turn_failure<S>(
-    sender: &mut S,
-    error: &anyhow::Error,
-    user_message: Option<&str>,
-) -> serde_json::Value
-where
-    S: futures_util::Sink<Message> + Unpin,
-{
-    let frame = ws_turn_failure_frame(&error.to_string(), user_message, user_message.is_some());
-    let _ = sender.send(Message::Text(frame.to_string().into())).await;
-    frame
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn_runner::persist_conversation_messages;
     use axum::{
         Json, Router,
         http::{HeaderMap, header},
@@ -1631,6 +1340,121 @@ mod tests {
                 .unwrap_or_default()
                 .contains(diagnostic),
             "WebSocket delivery must not fall back to the diagnostic when Fluent supplies text"
+        );
+    }
+
+    #[test]
+    fn turn_event_to_ws_frame_maps_every_variant_to_its_wire_shape() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+
+        // Usage is aggregated by the forward closure and never frame-serialized.
+        assert_eq!(
+            turn_event_to_ws_frame(&TurnEvent::Usage {
+                input_tokens: Some(1),
+                cached_input_tokens: Some(2),
+                output_tokens: Some(3),
+                cost_usd: Some(0.0001),
+            }),
+            None,
+        );
+
+        let frame = turn_event_to_ws_frame(&TurnEvent::Chunk { delta: "Hello".into() })
+            .expect("chunk frame");
+        assert_eq!(frame, serde_json::json!({ "type": "chunk", "content": "Hello" }));
+
+        let frame = turn_event_to_ws_frame(&TurnEvent::Thinking { delta: "hmm".into() })
+            .expect("thinking frame");
+        assert_eq!(frame, serde_json::json!({ "type": "thinking", "content": "hmm" }));
+
+        let frame = turn_event_to_ws_frame(&TurnEvent::ToolCall {
+            id: "call_1".into(),
+            name: "ls".into(),
+            args: serde_json::json!({ "path": "/tmp" }),
+        })
+        .expect("tool_call frame");
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "type": "tool_call",
+                "id": "call_1",
+                "name": "ls",
+                "args": { "path": "/tmp" },
+            })
+        );
+
+        let frame = turn_event_to_ws_frame(&TurnEvent::ToolResult {
+            id: "call_1".into(),
+            name: "ls".into(),
+            output: "file.txt".into(),
+            artifact: None,
+        })
+        .expect("tool_result frame");
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "type": "tool_result",
+                "id": "call_1",
+                "name": "ls",
+                "output": "file.txt",
+            }),
+            "the typed artifact metadata must not leak into the wire frame"
+        );
+
+        let frame = turn_event_to_ws_frame(&TurnEvent::ApprovalRequest {
+            request_id: "req_1".into(),
+            tool_name: "exec".into(),
+            arguments_summary: "run tests".into(),
+            timeout_secs: 30,
+        })
+        .expect("approval_request frame");
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "type": "approval_request",
+                "request_id": "req_1",
+                "tool": "exec",
+                "arguments_summary": "run tests",
+                "timeout_secs": 30,
+            })
+        );
+
+        // HistoryTrimmed must project exactly like the dedicated helper it calls.
+        let frame = turn_event_to_ws_frame(&TurnEvent::HistoryTrimmed {
+            dropped_messages: 4,
+            kept_turns: 2,
+            reason: "context window".into(),
+        })
+        .expect("history_trimmed frame");
+        assert_eq!(frame, history_trimmed_ws_frame(4, 2, "context window"));
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "type": "history_trimmed",
+                "dropped_messages": 4,
+                "kept_turns": 2,
+                "reason": "context window",
+            })
+        );
+
+        let frame = turn_event_to_ws_frame(&TurnEvent::Plan {
+            entries: vec![PlanEntry {
+                content: "step one".into(),
+                status: PlanStatus::Pending,
+                priority: PlanPriority::Medium,
+                active_form: None,
+            }],
+        })
+        .expect("plan frame");
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "type": "plan",
+                "entries": [{
+                    "content": "step one",
+                    "status": "pending",
+                    "priority": "medium",
+                }],
+            })
         );
     }
 
@@ -1814,6 +1638,233 @@ data: {\"type\":\"message_stop\"}\n\n",
             error["message"], "provider completed without final text or tool calls",
             "stable diagnostic must not leak into the user-facing WebSocket frame"
         );
+
+        gateway_server.abort();
+        mock_server.abort();
+    }
+
+    #[test]
+    fn websocket_success_turn_frame_sequence_matches_streaming_invariants() {
+        // Real WebSocket upgrade + real agent against a local Anthropic-shaped
+        // provider that streams one text delta. Asserts the frame-sequence
+        // invariants the transport-neutral refactor must preserve: chunk text
+        // reaches the client, Usage is aggregated and never frame-serialized,
+        // and exactly one terminal `done` frame closes the turn.
+        std::thread::Builder::new()
+            .name("ws-success-frame-sequence".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_success_turn_frame_sequence_inner());
+            })
+            .expect("spawn WebSocket frame-sequence thread")
+            .join()
+            .expect("WebSocket frame-sequence thread must not panic");
+    }
+
+    async fn websocket_success_turn_frame_sequence_inner() {
+        let mock_app = Router::new().route(
+            "/v1/messages",
+            post(|Json(request): Json<serde_json::Value>| async move {
+                if request["stream"].as_bool() == Some(true) {
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":1}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n",
+                    )
+                        .into_response()
+                } else {
+                    Json(serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "content": [{"type": "text", "text": "Hello"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 5}
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Anthropic fixture");
+        let mock_addr = mock_listener.local_addr().expect("fixture address");
+        let mock_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(mock_listener, mock_app)
+                .await
+                .expect("local Anthropic fixture serves");
+        });
+
+        let tmp = tempfile::tempdir().expect("temporary gateway workspace");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("gateway workspace");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.reliability.provider_retries = 0;
+        config.providers.models.anthropic.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    model: Some("claude-test".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.fixture".into(),
+                risk_profile: "fixture".into(),
+                runtime_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(workspace),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let state = crate::api::tests::test_state(config);
+        let gateway_app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state);
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local WebSocket gateway");
+        let gateway_addr = gateway_listener.local_addr().expect("gateway address");
+        let gateway_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(gateway_listener, gateway_app)
+                .await
+                .expect("local WebSocket gateway serves");
+        });
+
+        let (mut client, _) = connect_async(format!("ws://{gateway_addr}/ws/chat?agent=web"))
+            .await
+            .expect("WebSocket upgrade");
+        let first = client
+            .next()
+            .await
+            .expect("session_start frame")
+            .expect("session_start");
+        assert!(
+            first
+                .into_text()
+                .expect("text session_start")
+                .contains("session_start")
+        );
+        client
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+            .await
+            .expect("connect frame");
+        let connected = client
+            .next()
+            .await
+            .expect("connected frame")
+            .expect("connected");
+        assert!(
+            connected
+                .into_text()
+                .expect("text connected")
+                .contains("connected")
+        );
+        client
+            .send(ClientMessage::Text(r#"{"type":"message","content":"test"}"#.into()))
+            .await
+            .expect("chat message");
+
+        // Drain every frame until the terminal `done` frame. Auxiliary frames
+        // (plan, history_trimmed, ...) are allowed; what must hold is the
+        // invariant set below.
+        let mut frames = Vec::new();
+        let mut done = None;
+        for _ in 0..32 {
+            let frame = tokio::time::timeout(Duration::from_secs(3), client.next())
+                .await
+                .expect("gateway response deadline")
+                .expect("gateway stays connected")
+                .expect("gateway frame");
+            let text = frame.into_text().expect("text gateway frame");
+            let json: serde_json::Value = serde_json::from_str(&text).expect("JSON gateway frame");
+            if json["type"] == "done" {
+                done = Some(json);
+                break;
+            }
+            frames.push(json);
+        }
+        let done = done.expect("successful turn terminates with a done frame");
+
+        assert!(
+            frames.iter().all(|frame| frame["type"] != "usage"),
+            "Usage is aggregated by the forward closure, never frame-serialized: {:?}",
+            frames
+        );
+        assert!(
+            frames.iter().all(|frame| frame["type"] != "error" && frame["type"] != "aborted"),
+            "successful turn must not emit a terminal error or aborted frame: {:?}",
+            frames
+        );
+
+        let streamed: String = frames
+            .iter()
+            .filter(|frame| frame["type"] == "chunk")
+            .filter_map(|frame| frame["content"].as_str())
+            .collect();
+        assert_eq!(
+            streamed, "Hello",
+            "streamed chunk text must reach the client verbatim, got {:?}",
+            frames
+        );
+
+        assert_eq!(done["type"], "done");
+        assert_eq!(done["full_response"], "Hello");
+        // Identity fields are always concrete; usage/cost are provider-dependent
+        // and may legitimately be null when the fixture exposes no pricing.
+        for field in ["model", "provider", "max_context_tokens"] {
+            assert!(
+                done.get(field).is_some() && !done[field].is_null(),
+                "done frame must carry a concrete {field}"
+            );
+        }
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "tokens_used",
+            "cost_usd",
+            "last_input_tokens",
+        ] {
+            assert!(
+                done.get(field).is_some(),
+                "done frame must carry {field} (value may be null)"
+            );
+        }
 
         gateway_server.abort();
         mock_server.abort();
