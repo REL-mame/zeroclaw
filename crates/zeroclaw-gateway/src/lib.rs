@@ -10,8 +10,8 @@ pub mod acp;
 pub mod agent_owned_state;
 pub mod api;
 pub mod api_browse;
-pub mod api_config;
 pub mod api_chat_completions;
+pub mod api_config;
 pub mod api_logs;
 pub mod api_pairing;
 pub mod api_personality;
@@ -619,9 +619,7 @@ pub struct AppState {
     /// Key = raw session_key (e.g. `gw_<id>`), value = active connection count.
     /// A session is "owned" by at least one live WS connection while count > 0;
     /// HTTP chat refuses (409) while the lease is held.
-    pub ws_connections: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, usize>>,
-    >,
+    pub ws_connections: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.

@@ -291,13 +291,21 @@ mod tests {
 
     #[test]
     fn from_override_filters_excluded_and_flags_native_mode() {
-        use crate::tools::ToolSpec;
         use super::IterationToolSpecs;
+        use crate::tools::ToolSpec;
 
         let specs = vec![
-            ToolSpec::new("alpha", "Alpha does A", serde_json::json!({"type": "object"})),
+            ToolSpec::new(
+                "alpha",
+                "Alpha does A",
+                serde_json::json!({"type": "object"}),
+            ),
             ToolSpec::new("beta", "Beta does B", serde_json::json!({"type": "object"})),
-            ToolSpec::new("secret_tool", "Policy-excluded", serde_json::json!({"type": "object"})),
+            ToolSpec::new(
+                "secret_tool",
+                "Policy-excluded",
+                serde_json::json!({"type": "object"}),
+            ),
         ];
         let excluded = vec!["secret_tool".to_string()];
 

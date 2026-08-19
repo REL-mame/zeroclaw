@@ -228,7 +228,9 @@ pub async fn handle_ws_chat(
     // async block and lives until `handle_socket` returns, leaving no window
     // between "upgrade accepted" and "first poll" where the lease is unheld.
     // Semantics unchanged from master (provided id or fresh UUID; `gw_<id>`).
-    let session_id = params.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_id = params
+        .session_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
     let pre_ws_guard =
         WsConnectionGuard::new(session_key.clone(), Arc::clone(&state.ws_connections));
@@ -1026,7 +1028,7 @@ async fn process_chat_message(
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
 ) {
-    use crate::turn_runner::{TurnForwardResult, TurnRunnerHandle, run_gateway_turn, TurnStatus};
+    use crate::turn_runner::{TurnForwardResult, TurnRunnerHandle, TurnStatus, run_gateway_turn};
     use futures_util::StreamExt as _;
 
     // WebSocket-only steering channel. The sender side is captured into the
@@ -1294,7 +1296,6 @@ async fn process_chat_message(
     }
 }
 
-
 /// Map a streamed turn event to its WebSocket frame. `Usage` events are never
 /// framed — the transport consumes them for token aggregation instead.
 fn turn_event_to_ws_frame(event: &TurnEvent) -> Option<serde_json::Value> {
@@ -1309,7 +1310,9 @@ fn turn_event_to_ws_frame(event: &TurnEvent) -> Option<serde_json::Value> {
         TurnEvent::ToolCall { id, name, args } => {
             Some(serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args }))
         }
-        TurnEvent::ToolResult { id, name, output, .. } => Some(serde_json::json!({
+        TurnEvent::ToolResult {
+            id, name, output, ..
+        } => Some(serde_json::json!({
             "type": "tool_result",
             "id": id,
             "name": name,
@@ -1331,7 +1334,11 @@ fn turn_event_to_ws_frame(event: &TurnEvent) -> Option<serde_json::Value> {
             dropped_messages,
             kept_turns,
             reason,
-        } => Some(history_trimmed_ws_frame(*dropped_messages, *kept_turns, reason)),
+        } => Some(history_trimmed_ws_frame(
+            *dropped_messages,
+            *kept_turns,
+            reason,
+        )),
         TurnEvent::Plan { entries } => Some(serde_json::json!({
             "type": "plan",
             "entries": entries,
@@ -1459,13 +1466,23 @@ mod tests {
             None,
         );
 
-        let frame = turn_event_to_ws_frame(&TurnEvent::Chunk { delta: "Hello".into() })
-            .expect("chunk frame");
-        assert_eq!(frame, serde_json::json!({ "type": "chunk", "content": "Hello" }));
+        let frame = turn_event_to_ws_frame(&TurnEvent::Chunk {
+            delta: "Hello".into(),
+        })
+        .expect("chunk frame");
+        assert_eq!(
+            frame,
+            serde_json::json!({ "type": "chunk", "content": "Hello" })
+        );
 
-        let frame = turn_event_to_ws_frame(&TurnEvent::Thinking { delta: "hmm".into() })
-            .expect("thinking frame");
-        assert_eq!(frame, serde_json::json!({ "type": "thinking", "content": "hmm" }));
+        let frame = turn_event_to_ws_frame(&TurnEvent::Thinking {
+            delta: "hmm".into(),
+        })
+        .expect("thinking frame");
+        assert_eq!(
+            frame,
+            serde_json::json!({ "type": "thinking", "content": "hmm" })
+        );
 
         let frame = turn_event_to_ws_frame(&TurnEvent::ToolCall {
             id: "call_1".into(),
@@ -1867,7 +1884,7 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .expect("local WebSocket gateway serves");
         });
 
-        let (mut client, _) = connect_async(format!("ws://{gateway_addr}/ws/chat?agent=web"))
+        let (mut client, _) = connect_async(format!("ws://{gateway_addr}/ws/chat?agent=web")) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
             .await
             .expect("WebSocket upgrade");
         let first = client
@@ -1897,7 +1914,9 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .contains("connected")
         );
         client
-            .send(ClientMessage::Text(r#"{"type":"message","content":"test"}"#.into()))
+            .send(ClientMessage::Text(
+                r#"{"type":"message","content":"test"}"#.into(),
+            ))
             .await
             .expect("chat message");
 
@@ -1928,7 +1947,9 @@ data: {\"type\":\"message_stop\"}\n\n",
             frames
         );
         assert!(
-            frames.iter().all(|frame| frame["type"] != "error" && frame["type"] != "aborted"),
+            frames
+                .iter()
+                .all(|frame| frame["type"] != "error" && frame["type"] != "aborted"),
             "successful turn must not emit a terminal error or aborted frame: {:?}",
             frames
         );

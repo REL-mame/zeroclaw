@@ -1909,23 +1909,23 @@ impl DelegateTool {
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = scope_delegate_tool_specs_override(
-                        tool_specs_override,
-                        async move {
+                    let result =
+                        scope_delegate_tool_specs_override(tool_specs_override, async move {
                             scope_delegate_session_key(session_key, async move {
                                 crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                                     .scope(receipt_scope, async move {
-                                        Box::pin(
-                                            inner.execute_sync(&agent_name, &prompt, &args_clone),
-                                        )
+                                        Box::pin(inner.execute_sync(
+                                            &agent_name,
+                                            &prompt,
+                                            &args_clone,
+                                        ))
                                         .await
                                     })
                                     .await
                             })
                             .await
-                        },
-                    )
-                    .await;
+                        })
+                        .await;
                     (agent_name_for_return, result)
                 }
                 .instrument(::zeroclaw_log::attribution_span!(

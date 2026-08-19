@@ -10,13 +10,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::post;
-use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
@@ -30,9 +30,11 @@ use zeroclaw_providers::ChatMessage;
 use zeroclaw_runtime::agent::{Agent, TurnEvent};
 
 use crate::turn_runner::{
-    run_gateway_turn, TurnForwardResult, TurnOutcome, TurnRunnerHandle, TurnStatus,
+    TurnForwardResult, TurnOutcome, TurnRunnerHandle, TurnStatus, run_gateway_turn,
 };
-use crate::{gateway_long_running_request_timeout_secs, ws_session_active, AppState, RateLimitDecision};
+use crate::{
+    AppState, RateLimitDecision, gateway_long_running_request_timeout_secs, ws_session_active,
+};
 
 // ── Request wire types ──────────────────────────────────────────────────────
 
@@ -43,7 +45,7 @@ pub struct ChatCompletionRequest {
     pub model: String, // missing -> "" (default-agent shorthand)
     pub messages: Vec<ChatCompletionMessage>, // required
     #[serde(default)]
-    pub stream: bool, // missing -> false
+    pub stream: bool,    // missing -> false
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
     pub top_p: Option<f64>,
@@ -137,10 +139,10 @@ pub struct FunctionCall {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub(crate) struct ChatCompletionResponse {
-    id: String, // "chatcmpl-{uuid}"
+    id: String,           // "chatcmpl-{uuid}"
     object: &'static str, // "chat.completion"
-    created: u64, // Unix seconds
-    model: String, // echoes the request model
+    created: u64,         // Unix seconds
+    model: String,        // echoes the request model
     choices: Vec<NonStreamChoice>,
     usage: CompletionUsage,
 }
@@ -150,7 +152,7 @@ pub(crate) struct ChatCompletionResponse {
 pub(crate) struct NonStreamChoice {
     index: u32,
     message: AssistantMessage,
-    finish_reason: String, // "stop"
+    finish_reason: String,    // "stop"
     pub logprobs: Option<()>, // always null; placeholder to keep the field
 }
 
@@ -442,9 +444,17 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), ApiErr
             "reasoning_effort",
             "reasoning_effort is not supported per-request; configure model in provider settings",
         ),
-        (req.modalities.is_some(), "modalities", "only text output supported"),
+        (
+            req.modalities.is_some(),
+            "modalities",
+            "only text output supported",
+        ),
         (req.audio.is_some(), "audio", "audio output not supported"),
-        (req.prediction.is_some(), "prediction", "predicted outputs not supported"),
+        (
+            req.prediction.is_some(),
+            "prediction",
+            "predicted outputs not supported",
+        ),
         (
             req.web_search_options.is_some(),
             "web_search_options",
@@ -502,14 +512,19 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), ApiError> {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("messages[{i}].tool_call_id is not supported; tool execution is transparent"),
+                &format!(
+                    "messages[{i}].tool_call_id is not supported; tool execution is transparent"
+                ),
                 None,
                 Some("messages"),
             ));
         }
         // ③ role allow-list (4); tool/function roles are explicitly rejected
         // (RFC line 36), not silently folded into prompt text.
-        if !matches!(msg.role.as_str(), "system" | "developer" | "user" | "assistant") {
+        if !matches!(
+            msg.role.as_str(),
+            "system" | "developer" | "user" | "assistant"
+        ) {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -527,7 +542,9 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), ApiError> {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("messages[{i}].tool_calls is not supported; tool execution is transparent"),
+                &format!(
+                    "messages[{i}].tool_calls is not supported; tool execution is transparent"
+                ),
                 None,
                 Some("messages"),
             ));
@@ -1041,9 +1058,7 @@ pub(crate) async fn handle_chat_completions(
 
     // ── ③ validation ────────────────────────────────────────────────────
     // Request-level rejections run before message-level ones.
-    if let Err(e) =
-        validate_unsupported_params(&request).and_then(|_| validate_request(&request))
-    {
+    if let Err(e) = validate_unsupported_params(&request).and_then(|_| validate_request(&request)) {
         return e.into_response();
     }
 
@@ -1353,15 +1368,8 @@ async fn stream_mode(
             match event {
                 TurnEvent::Chunk { delta } => {
                     accumulated_text.push_str(&delta);
-                    let chunk = make_chunk(
-                        &id_fwd,
-                        created,
-                        &model_fwd,
-                        None,
-                        Some(delta),
-                        None,
-                        None,
-                    );
+                    let chunk =
+                        make_chunk(&id_fwd, created, &model_fwd, None, Some(delta), None, None);
                     if body_tx_fwd.send(Ok(chunk)).await.is_err() {
                         // Client disconnect: stop the turn and the drain.
                         cancel_token.cancel();
@@ -1629,9 +1637,9 @@ async fn blocking_mode(
                 .error
                 .as_ref()
                 .map(|f| {
-                    f.user_message.clone().unwrap_or_else(|| {
-                        zeroclaw_providers::sanitize_api_error(&f.diagnostic)
-                    })
+                    f.user_message
+                        .clone()
+                        .unwrap_or_else(|| zeroclaw_providers::sanitize_api_error(&f.diagnostic))
                 })
                 .unwrap_or_else(|| "Agent turn failed".to_string());
             error_response(
@@ -1778,7 +1786,7 @@ mod tests {
 
     /// Run both validators; the first rejection wins (unsupported params
     /// checked before message-level validation).
-        fn run_validators(req: &ChatCompletionRequest) -> Result<(), ApiError> {
+    fn run_validators(req: &ChatCompletionRequest) -> Result<(), ApiError> {
         validate_unsupported_params(req).and_then(|_| validate_request(req))
     }
 
@@ -2049,12 +2057,29 @@ mod tests {
         // omission), matching OpenAI's "null means unset" convention — so none
         // of the 23 rejected fields trips validation when passed as null.
         let fields = [
-            "max_tokens", "top_p", "stop", "presence_penalty",
-            "frequency_penalty", "n", "response_format", "seed", "logprobs",
-            "top_logprobs", "user", "logit_bias", "max_completion_tokens",
-            "temperature", "parallel_tool_calls", "service_tier", "functions",
-            "function_call", "reasoning_effort", "modalities", "audio",
-            "prediction", "web_search_options",
+            "max_tokens",
+            "top_p",
+            "stop",
+            "presence_penalty",
+            "frequency_penalty",
+            "n",
+            "response_format",
+            "seed",
+            "logprobs",
+            "top_logprobs",
+            "user",
+            "logit_bias",
+            "max_completion_tokens",
+            "temperature",
+            "parallel_tool_calls",
+            "service_tier",
+            "functions",
+            "function_call",
+            "reasoning_effort",
+            "modalities",
+            "audio",
+            "prediction",
+            "web_search_options",
         ];
         assert_eq!(fields.len(), 23);
         for param in fields {
@@ -2189,7 +2214,10 @@ mod tests {
     #[test]
     fn default_shorthand_routes_to_default_agent() {
         let config = config_with_agents(&[("default", true)]);
-        assert_eq!(agent_alias_from_model("", &config), Ok("default".to_string()));
+        assert_eq!(
+            agent_alias_from_model("", &config),
+            Ok("default".to_string())
+        );
         assert_eq!(
             agent_alias_from_model("zeroclaw", &config),
             Ok("default".to_string())
@@ -2210,7 +2238,10 @@ mod tests {
         // No `default` key: empty model resolves via the runtime fallback —
         // lexicographically smallest *enabled* agent (same as webhook chat).
         let config = config_with_agents(&[("research", true), ("coding", true)]);
-        assert_eq!(agent_alias_from_model("", &config), Ok("coding".to_string()));
+        assert_eq!(
+            agent_alias_from_model("", &config),
+            Ok("coding".to_string())
+        );
     }
 
     #[test]
@@ -2263,10 +2294,12 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "model");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Unknown agent `nope`"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown agent `nope`")
+        );
     }
 
     #[test]
@@ -2287,7 +2320,10 @@ mod tests {
         // resolution (resolved_runtime_agent_alias prefers the literal
         // `default` key without an enabled check — inherited master behaviour).
         let config = config_with_agents(&[("default", false), ("coding", true)]);
-        assert_eq!(agent_alias_from_model("", &config), Ok("default".to_string()));
+        assert_eq!(
+            agent_alias_from_model("", &config),
+            Ok("default".to_string())
+        );
     }
 
     // ── Chat-completions handler orchestration ───────────────────────────
@@ -2296,8 +2332,7 @@ mod tests {
     use axum::routing::post;
     use zeroclaw_config::multi_agent::AgentWorkspaceConfig;
     use zeroclaw_config::schema::{
-        AnthropicModelProviderConfig, ModelProviderConfig, RiskProfileConfig,
-        RuntimeProfileConfig,
+        AnthropicModelProviderConfig, ModelProviderConfig, RiskProfileConfig, RuntimeProfileConfig,
     };
     use zeroclaw_infra::session_backend::SessionBackend;
     use zeroclaw_infra::session_store::SessionStore;
@@ -2320,10 +2355,9 @@ mod tests {
                 },
             },
         );
-        config.risk_profiles.insert(
-            "test-profile".to_string(),
-            RiskProfileConfig::default(),
-        );
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
         config.agents.insert(
             alias.to_string(),
             AliasedAgentConfig {
@@ -2378,7 +2412,13 @@ mod tests {
         let out_headers = response.headers().clone();
         let status = response.status();
         let text = String::from_utf8(
-            response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
         )
         .unwrap();
         (status, out_headers, text)
@@ -2520,7 +2560,15 @@ mod tests {
 
     #[test]
     fn chunk_json_only_present_fields() {
-        let chunk = chunk_json("id", 1, "m", Some("assistant"), Some(String::new()), None, None);
+        let chunk = chunk_json(
+            "id",
+            1,
+            "m",
+            Some("assistant"),
+            Some(String::new()),
+            None,
+            None,
+        );
         assert_eq!(chunk["object"], "chat.completion.chunk");
         assert_eq!(chunk["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(chunk["choices"][0]["delta"]["content"], "");
@@ -2548,8 +2596,12 @@ mod tests {
     async fn rejects_noncanonical_session_key() {
         let state = test_state(chat_config("test-agent"));
         // Space and `!` fall outside the ASCII `[a-z0-9_-]` canonical gate.
-        let (status, headers, body) =
-            call_handler(state, Some("bad key!"), chat_body("zeroclaw/test-agent", false)).await;
+        let (status, headers, body) = call_handler(
+            state,
+            Some("bad key!"),
+            chat_body("zeroclaw/test-agent", false),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "x-session-key");
@@ -2560,8 +2612,12 @@ mod tests {
     #[tokio::test]
     async fn rejects_missing_gw_prefix() {
         let state = test_state(chat_config("test-agent"));
-        let (status, _, body) =
-            call_handler(state, Some("abc123"), chat_body("zeroclaw/test-agent", false)).await;
+        let (status, _, body) = call_handler(
+            state,
+            Some("abc123"),
+            chat_body("zeroclaw/test-agent", false),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "x-session-key");
@@ -2628,7 +2684,11 @@ mod tests {
 
         // Hold the lock and fill the queue (max depth 8) so the handler's
         // acquire observes `current >= max_queue_depth`.
-        let _held = state.session_queue.acquire(key).await.expect("first acquire");
+        let _held = state
+            .session_queue
+            .acquire(key)
+            .await
+            .expect("first acquire");
         let mut waiters = Vec::new();
         for _ in 0..7 {
             let queue = Arc::clone(&state.session_queue);
@@ -2656,7 +2716,11 @@ mod tests {
     async fn ws_owns_session_http_409() {
         let state = test_state(chat_config("test-agent"));
         let key = "gw_ws_held";
-        state.ws_connections.lock().unwrap().insert(key.to_string(), 1);
+        state
+            .ws_connections
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), 1);
         let (status, headers, body) =
             call_handler(state, Some(key), chat_body("zeroclaw/test-agent", false)).await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -2674,8 +2738,12 @@ mod tests {
         });
         let mut state = test_state(chat_config("test-agent"));
         state.session_backend = Some(backend);
-        let (status, headers, body) =
-            call_handler(state, Some("gw_reuse"), chat_body("zeroclaw/test-agent", false)).await;
+        let (status, headers, body) = call_handler(
+            state,
+            Some("gw_reuse"),
+            chat_body("zeroclaw/test-agent", false),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "x-session-key");
@@ -2696,8 +2764,12 @@ mod tests {
         state.session_backend = Some(backend);
         // Single-message + key -> State A loads the (empty) backend, owner
         // matches, so no rejection; the turn is dispatched.
-        let (status, headers, body) =
-            call_handler(state, Some("gw_same"), chat_body("zeroclaw/test-agent", false)).await;
+        let (status, headers, body) = call_handler(
+            state,
+            Some("gw_same"),
+            chat_body("zeroclaw/test-agent", false),
+        )
+        .await;
         // The agent turn fails because `uri` is unreachable (127.0.0.1:1), but
         // the important part is that ownership did NOT reject — a 500 from the
         // turn, not a 400 ownership error.
@@ -2719,14 +2791,20 @@ mod tests {
             .unwrap();
         let mut state = test_state(chat_config("test-agent"));
         state.session_backend = Some(backend);
-        let (status, headers, body) =
-            call_handler(state, Some("gw_legacy"), chat_body("zeroclaw/test-agent", false)).await;
+        let (status, headers, body) = call_handler(
+            state,
+            Some("gw_legacy"),
+            chat_body("zeroclaw/test-agent", false),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("ownership"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("ownership")
+        );
         assert_eq!(headers["x-session-key"].to_str().unwrap(), "gw_legacy");
     }
 
@@ -2742,15 +2820,21 @@ mod tests {
         // Single message + fresh key -> State A loads an empty backend, claim
         // degrades, and the turn is dispatched (fails on the unreachable
         // fixture URI, not on ownership).
-        let (status, headers, _body) =
-            call_handler(state, Some("gw_fresh"), chat_body("zeroclaw/test-agent", false)).await;
+        let (status, headers, _body) = call_handler(
+            state,
+            Some("gw_fresh"),
+            chat_body("zeroclaw/test-agent", false),
+        )
+        .await;
         assert_ne!(status, StatusCode::BAD_REQUEST);
         assert_eq!(headers["x-session-key"].to_str().unwrap(), "gw_fresh");
     }
 
     // ── Full-turn streaming + blocking ───────────────────────────────────
 
-    async fn serve_fixture(router: axum::Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    async fn serve_fixture(
+        router: axum::Router,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local provider fixture");
@@ -2816,14 +2900,12 @@ data: {\"type\":\"message_stop\"}\n\n";
                 },
             },
         );
-        config.risk_profiles.insert(
-            "fixture".to_string(),
-            RiskProfileConfig::default(),
-        );
-        config.runtime_profiles.insert(
-            "fixture".to_string(),
-            RuntimeProfileConfig::default(),
-        );
+        config
+            .risk_profiles
+            .insert("fixture".to_string(), RiskProfileConfig::default());
+        config
+            .runtime_profiles
+            .insert("fixture".to_string(), RuntimeProfileConfig::default());
         config.agents.insert(
             "test-agent".to_string(),
             AliasedAgentConfig {
@@ -2866,13 +2948,20 @@ data: {\"type\":\"message_stop\"}\n\n";
             serve_fixture(anthropic_fixture(OK_STREAM.to_string(), ok_json_body())).await;
         let (config, _tmp) = chat_turn_config(&format!("http://{addr}"), 10);
         let state = test_state(config);
-        let (status, headers, sse) = call_stream(state, None, chat_body("zeroclaw/test-agent", true)).await;
+        let (status, headers, sse) =
+            call_stream(state, None, chat_body("zeroclaw/test-agent", true)).await;
         server.abort();
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(headers["content-type"].to_str().unwrap(), "text/event-stream");
+        assert_eq!(
+            headers["content-type"].to_str().unwrap(),
+            "text/event-stream"
+        );
         assert!(
-            headers["x-session-key"].to_str().unwrap().starts_with("gw_"),
+            headers["x-session-key"]
+                .to_str()
+                .unwrap()
+                .starts_with("gw_"),
             "a fresh key is generated and echoed"
         );
 
@@ -2903,8 +2992,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // Terminal finish chunk then the [DONE] sentinel.
         assert_eq!(frames[frames.len() - 1], "[DONE]");
-        let finish: serde_json::Value =
-            serde_json::from_str(&frames[frames.len() - 2]).unwrap();
+        let finish: serde_json::Value = serde_json::from_str(&frames[frames.len() - 2]).unwrap();
         assert_eq!(finish["choices"][0]["finish_reason"], "stop");
         assert_eq!(finish["choices"][0]["delta"], json!({}));
     }
@@ -2919,9 +3007,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             sse_data_frames(sse).iter().any(|f| {
                 serde_json::from_str::<serde_json::Value>(f)
                     .ok()
-                    .is_some_and(|v| {
-                        v["choices"].as_array().is_some_and(|c| c.is_empty())
-                    })
+                    .is_some_and(|v| v["choices"].as_array().is_some_and(|c| c.is_empty()))
             })
         };
 
@@ -2943,9 +3029,16 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // include_usage unset (default) -> no usage chunk.
         let (config2, _tmp2) = chat_turn_config(&uri, 10);
-        let (_, _, sse2) =
-            call_stream(test_state(config2), None, chat_body("zeroclaw/test-agent", true)).await;
-        assert!(!has_usage_chunk(&sse2), "usage chunk must be absent by default");
+        let (_, _, sse2) = call_stream(
+            test_state(config2),
+            None,
+            chat_body("zeroclaw/test-agent", true),
+        )
+        .await;
+        assert!(
+            !has_usage_chunk(&sse2),
+            "usage chunk must be absent by default"
+        );
 
         server.abort();
     }
@@ -2970,10 +3063,18 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
-        let (addr, server) =
-            serve_fixture(anthropic_fixture(THINKING_STREAM.to_string(), ok_json_body())).await;
+        let (addr, server) = serve_fixture(anthropic_fixture(
+            THINKING_STREAM.to_string(),
+            ok_json_body(),
+        ))
+        .await;
         let (config, _tmp) = chat_turn_config(&format!("http://{addr}"), 10);
-        let (_, _, sse) = call_stream(test_state(config), None, chat_body("zeroclaw/test-agent", true)).await;
+        let (_, _, sse) = call_stream(
+            test_state(config),
+            None,
+            chat_body("zeroclaw/test-agent", true),
+        )
+        .await;
         server.abort();
 
         assert!(
@@ -2999,8 +3100,12 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn stream_timeout_emits_error_event() {
         let (addr, server) = serve_fixture(hang_router()).await;
         let (config, _tmp) = chat_turn_config(&format!("http://{addr}"), 1);
-        let (status, _, sse) =
-            call_stream(test_state(config), None, chat_body("zeroclaw/test-agent", true)).await;
+        let (status, _, sse) = call_stream(
+            test_state(config),
+            None,
+            chat_body("zeroclaw/test-agent", true),
+        )
+        .await;
         server.abort();
 
         // The SSE response starts immediately; the deadline is signalled in-band.
@@ -3020,8 +3125,12 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn stream_error_emits_internal_error() {
         let (addr, server) = serve_fixture(failing_router()).await;
         let (config, _tmp) = chat_turn_config(&format!("http://{addr}"), 10);
-        let (status, _, sse) =
-            call_stream(test_state(config), None, chat_body("zeroclaw/test-agent", true)).await;
+        let (status, _, sse) = call_stream(
+            test_state(config),
+            None,
+            chat_body("zeroclaw/test-agent", true),
+        )
+        .await;
         server.abort();
 
         assert_eq!(status, StatusCode::OK);
@@ -3041,8 +3150,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (addr, server) =
             serve_fixture(anthropic_fixture(OK_STREAM.to_string(), ok_json_body())).await;
         let (config, _tmp) = chat_turn_config(&format!("http://{addr}"), 10);
-        let (status, headers, body) =
-            call_handler(test_state(config), None, chat_body("zeroclaw/test-agent", false)).await;
+        let (status, headers, body) = call_handler(
+            test_state(config),
+            None,
+            chat_body("zeroclaw/test-agent", false),
+        )
+        .await;
         server.abort();
 
         assert_eq!(status, StatusCode::OK);
@@ -3056,15 +3169,24 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert_eq!(body["usage"]["prompt_tokens"], 1);
         assert_eq!(body["usage"]["completion_tokens"], 5);
-        assert!(headers["x-session-key"].to_str().unwrap().starts_with("gw_"));
+        assert!(
+            headers["x-session-key"]
+                .to_str()
+                .unwrap()
+                .starts_with("gw_")
+        );
     }
 
     #[tokio::test]
     async fn blocking_timeout_408() {
         let (addr, server) = serve_fixture(hang_router()).await;
         let (config, _tmp) = chat_turn_config(&format!("http://{addr}"), 1);
-        let (status, _, body) =
-            call_handler(test_state(config), None, chat_body("zeroclaw/test-agent", false)).await;
+        let (status, _, body) = call_handler(
+            test_state(config),
+            None,
+            chat_body("zeroclaw/test-agent", false),
+        )
+        .await;
         server.abort();
         assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
         assert_eq!(body["error"]["type"], "timeout");
@@ -3075,8 +3197,12 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn blocking_error_500() {
         let (addr, server) = serve_fixture(failing_router()).await;
         let (config, _tmp) = chat_turn_config(&format!("http://{addr}"), 10);
-        let (status, _, body) =
-            call_handler(test_state(config), None, chat_body("zeroclaw/test-agent", false)).await;
+        let (status, _, body) = call_handler(
+            test_state(config),
+            None,
+            chat_body("zeroclaw/test-agent", false),
+        )
+        .await;
         server.abort();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"]["type"], "internal_error");
@@ -3116,7 +3242,10 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn rejects_non_utf8_session_key() {
         let state = test_state(chat_config("test-agent"));
         let mut headers = HeaderMap::new();
-        headers.insert("x-session-key", HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap());
+        headers.insert(
+            "x-session-key",
+            HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap(),
+        );
         let response = handle_chat_completions(
             State(state),
             ConnectInfo("127.0.0.1:8080".parse().unwrap()),
@@ -3142,7 +3271,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             sanitize_session_key(ws_session_id)
         );
         // A key without the prefix degrades to the raw value.
-        assert_eq!(http_memory_scope("naked-key"), sanitize_session_key("naked-key"));
+        assert_eq!(
+            http_memory_scope("naked-key"),
+            sanitize_session_key("naked-key")
+        );
         // Non-ASCII is sanitized identically on both sides.
         assert_eq!(
             http_memory_scope("gw_slack_C1_user one"),
@@ -3172,7 +3304,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         )
     }
 
-    fn request_message_contents(requests: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> Vec<String> {
+    fn request_message_contents(
+        requests: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> Vec<String> {
         let guard = requests.lock().unwrap();
         guard
             .first()
@@ -3225,12 +3359,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (config, _tmp) = chat_turn_config(&format!("http://{addr}"), 10);
         let mut state = test_state(config);
         state.session_backend = Some(Arc::clone(&backend) as Arc<dyn SessionBackend>);
-        let (status, _, _) = call_handler(
-            state,
-            Some("gw_a"),
-            chat_body("zeroclaw/test-agent", false),
-        )
-        .await;
+        let (status, _, _) =
+            call_handler(state, Some("gw_a"), chat_body("zeroclaw/test-agent", false)).await;
         server.abort();
 
         assert_eq!(status, StatusCode::OK);
@@ -3373,8 +3503,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (addr, server) =
             serve_fixture(anthropic_fixture(TOOL_STREAM.to_string(), ok_json_body())).await;
         let (config, _tmp) = chat_turn_config(&format!("http://{addr}"), 10);
-        let (_, _, sse) =
-            call_stream(test_state(config), None, chat_body("zeroclaw/test-agent", true)).await;
+        let (_, _, sse) = call_stream(
+            test_state(config),
+            None,
+            chat_body("zeroclaw/test-agent", true),
+        )
+        .await;
         server.abort();
 
         let frames = sse_data_frames(&sse);
@@ -3460,7 +3594,10 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn configured_tools() -> HashMap<String, ToolSpec> {
         let mut map = HashMap::new();
         for (name, desc) in [("alpha", "Alpha does A"), ("beta", "Beta does B")] {
-            map.insert(name.to_string(), ToolSpec::new(name, desc, json!({"type": "object"})));
+            map.insert(
+                name.to_string(),
+                ToolSpec::new(name, desc, json!({"type": "object"})),
+            );
         }
         map
     }
@@ -3485,8 +3622,14 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn parse_tool_choice_auto_and_none() {
         assert_eq!(parse_tool_choice(&None), ToolChoiceMode::Auto);
-        assert_eq!(parse_tool_choice(&Some(json!("auto"))), ToolChoiceMode::Auto);
-        assert_eq!(parse_tool_choice(&Some(json!("none"))), ToolChoiceMode::None);
+        assert_eq!(
+            parse_tool_choice(&Some(json!("auto"))),
+            ToolChoiceMode::Auto
+        );
+        assert_eq!(
+            parse_tool_choice(&Some(json!("none"))),
+            ToolChoiceMode::None
+        );
     }
 
     #[test]
@@ -3511,10 +3654,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "tools");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("must not be empty"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("must not be empty")
+        );
     }
 
     #[tokio::test]
@@ -3524,10 +3669,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["param"], "tools");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Unknown tool(s): nope"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown tool(s): nope")
+        );
     }
 
     #[test]
@@ -3619,7 +3766,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(body["error"]["status"], 413);
         assert_eq!(
             body["error"]["message"].as_str().unwrap(),
-            format!("Request body exceeds the {} byte limit", crate::MAX_BODY_SIZE)
+            format!(
+                "Request body exceeds the {} byte limit",
+                crate::MAX_BODY_SIZE
+            )
         );
     }
 

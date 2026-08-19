@@ -18,8 +18,8 @@ use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_memory::consolidation::consolidate_turn;
 use zeroclaw_providers::{ChatMessage, ConversationMessage};
 use zeroclaw_runtime::agent::cost::{
-    build_model_provider_pricing, ToolLoopCostTrackingContext, TurnUsage,
-    TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE,
+    TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext, TurnUsage,
+    build_model_provider_pricing,
 };
 use zeroclaw_runtime::agent::loop_::{is_tool_loop_cancelled, scope_session_key};
 use zeroclaw_runtime::agent::{Agent, TurnEvent};
@@ -230,9 +230,10 @@ where
         ToolLoopCostTrackingContext::new(tracker.clone(), Arc::new(pricing))
             .with_agent_alias(&turn_alias)
     });
-    let turn_usage = state.cost_tracker.as_ref().map(|_| {
-        Arc::new(parking_lot::Mutex::new(TurnUsage::default()))
-    });
+    let turn_usage = state
+        .cost_tracker
+        .as_ref()
+        .map(|_| Arc::new(parking_lot::Mutex::new(TurnUsage::default())));
 
     // Resolve the context budget for this agent — the runtime-profile budget
     // (same source the context meter uses), not the provider model-window
@@ -465,7 +466,8 @@ where
             }
         }
         (Err(error), TurnStatus::Cancelled | TurnStatus::TimedOut) => {
-            let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+            let marker =
+                zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
             let truncated = if accumulated_text.is_empty() {
                 marker
             } else {
