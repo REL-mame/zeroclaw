@@ -232,6 +232,50 @@ pub(crate) fn error_response(
         .into_response()
 }
 
+/// Lightweight error value threaded through the request pipeline and turned
+/// into an axum `Response` only at the HTTP boundary. Unlike `Response` it is a
+/// small struct, so internal `Result<T, ApiError>` returns do not trip
+/// `clippy::result_large_err`. `IntoResponse` reuses `error_response`, so the
+/// wire envelope is byte-for-byte identical to returning the error directly.
+#[derive(Debug, Clone)]
+pub(crate) struct ApiError {
+    status: StatusCode,
+    error_type: &'static str,
+    message: String,
+    code: Option<&'static str>,
+    param: Option<&'static str>,
+}
+
+impl ApiError {
+    pub(crate) fn new(
+        status: StatusCode,
+        error_type: &'static str,
+        message: &str,
+        code: Option<&'static str>,
+        param: Option<&'static str>,
+    ) -> Self {
+        Self {
+            status,
+            error_type,
+            message: message.to_string(),
+            code,
+            param,
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        error_response(
+            self.status,
+            self.error_type,
+            &self.message,
+            self.code,
+            self.param,
+        )
+    }
+}
+
 // ── Request validation ──────────────────────────────────────────────────────
 
 /// Reject the 23 request-level fields ZeroClaw does not support, each with a
@@ -241,11 +285,10 @@ pub(crate) fn error_response(
 /// A field is rejected only when it is present (`Some`), whatever its value —
 /// "explicit 400 instead of silent ignore". `metadata`/`store` are benign
 /// annotations and intentionally skipped here.
-#[allow(clippy::result_large_err)]
-fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Response> {
+fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), ApiError> {
     // 5.1 — generation-settings fields, each with a distinct message.
     if req.max_tokens.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "max_tokens is not supported per-request; configure in provider settings",
@@ -254,7 +297,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.top_p.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "top_p is not supported per-request",
@@ -263,7 +306,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.stop.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "stop is not supported per-request",
@@ -272,7 +315,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.presence_penalty.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "presence_penalty is not supported per-request",
@@ -281,7 +324,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.frequency_penalty.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "frequency_penalty is not supported per-request",
@@ -290,7 +333,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.n.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "n is not supported; single completion per request",
@@ -299,7 +342,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.response_format.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "response_format is not supported; configure output format in provider settings",
@@ -308,7 +351,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.seed.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "seed is not supported; configure in provider settings",
@@ -317,7 +360,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.logprobs.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "logprobs is not supported",
@@ -326,7 +369,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.top_logprobs.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "top_logprobs is not supported",
@@ -335,7 +378,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.user.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "user is not supported",
@@ -344,7 +387,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.logit_bias.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "logit_bias is not supported",
@@ -353,7 +396,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ));
     }
     if req.max_completion_tokens.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "max_completion_tokens is not supported; use provider settings",
@@ -364,7 +407,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
     // Omission keeps the routed agent's configured temperature; explicit
     // per-request temperature is rejected.
     if req.temperature.is_some() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "temperature is not supported per-request; set `temperature` on the routed agent's provider model",
@@ -410,7 +453,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
         ),
     ] {
         if present {
-            return Err(error_response(
+            return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 message,
@@ -432,10 +475,9 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
 /// `tools` shape checks and the `tool_choice` shape gate run at the end of
 /// this function (R9); the name→authoritative-spec mapping itself happens in
 /// the handler where the agent's tool directory is available.
-#[allow(clippy::result_large_err)]
-fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
+fn validate_request(req: &ChatCompletionRequest) -> Result<(), ApiError> {
     if req.messages.is_empty() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "messages must not be empty",
@@ -446,7 +488,7 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
     for (i, msg) in req.messages.iter().enumerate() {
         // ① name: not propagated under transparent execution.
         if msg.name.is_some() {
-            return Err(error_response(
+            return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 &format!(
@@ -458,7 +500,7 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
         }
         // ② tool_call_id: same rationale.
         if msg.tool_call_id.is_some() {
-            return Err(error_response(
+            return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 &format!("messages[{i}].tool_call_id is not supported; tool execution is transparent"),
@@ -469,7 +511,7 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
         // ③ role allow-list (4); tool/function roles are explicitly rejected
         // (RFC line 36), not silently folded into prompt text.
         if !matches!(msg.role.as_str(), "system" | "developer" | "user" | "assistant") {
-            return Err(error_response(
+            return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 &format!(
@@ -483,7 +525,7 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
         }
         // ④ tool_calls: meaningless under transparent execution.
         if msg.tool_calls.is_some() {
-            return Err(error_response(
+            return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 &format!("messages[{i}].tool_calls is not supported; tool execution is transparent"),
@@ -497,7 +539,7 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
     if let Some(ref tools) = req.tools {
         for tool in tools {
             if tool.kind != "function" {
-                return Err(error_response(
+                return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     "Only 'function' tool type is supported",
@@ -506,7 +548,7 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
                 ));
             }
             if tool.function.name.trim().is_empty() {
-                return Err(error_response(
+                return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     "tool.function.name is required",
@@ -527,7 +569,7 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
             // `unsupported_parameter` (parameter supported, value not), while
             // malformed shapes stay `invalid_request_error`.
             serde_json::Value::Object(_) => {
-                return Err(error_response(
+                return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "unsupported_parameter",
                     "specific-function tool_choice is not supported; use \"auto\" or \"none\"",
@@ -536,7 +578,7 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
                 ));
             }
             _ => {
-                return Err(error_response(
+                return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     "tool_choice supports only \"auto\" or \"none\"",
@@ -615,19 +657,18 @@ fn authoritative_specs_for(
 /// disables tools); `auto` with no `tools` → `Ok(None)` = the default agent
 /// tool set; `auto` with an allow-list → name-only whitelist resolution
 /// (unknown names are a fail-closed 400, empty lists are rejected).
-#[allow(clippy::result_large_err)]
 fn resolve_tool_specs(
     tool_choice: &Option<serde_json::Value>,
     tools: &Option<Vec<ChatCompletionTool>>,
     configured: &HashMap<String, ToolSpec>,
-) -> Result<Option<Vec<ToolSpec>>, Response> {
+) -> Result<Option<Vec<ToolSpec>>, ApiError> {
     match parse_tool_choice(tool_choice) {
         ToolChoiceMode::None => Ok(Some(Vec::new())),
         ToolChoiceMode::Auto => match tools {
             None => Ok(None),
             Some(requested) => {
                 if requested.is_empty() {
-                    return Err(error_response(
+                    return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
                         "invalid_request_error",
                         "tools list must not be empty",
@@ -641,7 +682,7 @@ fn resolve_tool_specs(
                     .map(|t| t.function.name.as_str())
                     .collect();
                 if !unknown.is_empty() {
-                    return Err(error_response(
+                    return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
                         "invalid_request_error",
                         &format!("Unknown tool(s): {}", unknown.join(", ")),
@@ -704,15 +745,14 @@ fn agent_alias_from_model(model: &str, config: &Config) -> Result<String, String
 /// is still reachable when named directly (same as WS `?agent=`).
 /// The `Err` Response is the handler's return type (same shape as
 /// `validate_request`).
-#[allow(clippy::result_large_err)]
 pub(crate) fn resolve_agent_alias_from_model(
     model: &str,
     config: &Config,
-) -> Result<String, Response> {
+) -> Result<String, ApiError> {
     let alias = match agent_alias_from_model(model, config) {
         Ok(alias) => alias,
         Err(e) => {
-            return Err(error_response(
+            return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 &e,
@@ -723,7 +763,7 @@ pub(crate) fn resolve_agent_alias_from_model(
     };
 
     if config.agent(&alias).is_none() {
-        return Err(error_response(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             &format!("Unknown agent `{alias}` — no [agents.{alias}] entry configured."),
@@ -755,15 +795,14 @@ pub fn is_http_canonical_session_key(key: &str) -> bool {
 /// memory scope with no second prefixing. An absent header produces a fresh
 /// `gw_{uuid}`. Returns `(session_key, had_header)`; the bool drives the
 /// history-load precedence. Invalid values fail closed with 400.
-#[allow(clippy::result_large_err)]
-fn extract_session_key(headers: &HeaderMap) -> Result<(String, bool), Response> {
+fn extract_session_key(headers: &HeaderMap) -> Result<(String, bool), ApiError> {
     match headers.get("x-session-key") {
         Some(value) => {
             // A non-UTF-8 header is a client error, not a missing key:
             // rejecting loudly avoids silently minting a fresh session that
             // would claim ownership away from the caller's real one.
             let key = value.to_str().map_err(|_| {
-                error_response(
+                ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     "x-session-key must be a valid UTF-8 string",
@@ -775,7 +814,7 @@ fn extract_session_key(headers: &HeaderMap) -> Result<(String, bool), Response> 
                 // An empty value is a client error, not a missing key: an
                 // explicit 400 avoids silently minting a fresh session (and
                 // stamping ownership on it) the caller did not ask for.
-                return Err(error_response(
+                return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     "x-session-key must not be empty",
@@ -784,7 +823,7 @@ fn extract_session_key(headers: &HeaderMap) -> Result<(String, bool), Response> 
                 ));
             }
             if !key.starts_with("gw_") || !is_http_canonical_session_key(key) {
-                return Err(error_response(
+                return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     "x-session-key must be a canonical `gw_`-prefixed key (lowercase ASCII [a-z0-9_-])",
@@ -953,7 +992,6 @@ pub(crate) fn build_chat_completions_router(state: AppState, enabled: bool) -> R
 /// Steps 1–4 run before the session key is known and do not echo it; from step
 /// 5 onward every error echoes the complete `x-session-key`. Step 11 (tool
 /// whitelist) and step 12 (dispatch) close the orchestration.
-#[allow(clippy::result_large_err)]
 pub(crate) async fn handle_chat_completions(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -1004,17 +1042,17 @@ pub(crate) async fn handle_chat_completions(
 
     // ── ③ validation ────────────────────────────────────────────────────
     // Request-level rejections run before message-level ones.
-    if let Err(response) =
+    if let Err(e) =
         validate_unsupported_params(&request).and_then(|_| validate_request(&request))
     {
-        return response;
+        return e.into_response();
     }
 
     // ── ④ model routing + provider-model presence ───────────────────────
     let config = state.config.read().clone();
     let alias = match resolve_agent_alias_from_model(&request.model, &config) {
         Ok(alias) => alias,
-        Err(response) => return response,
+        Err(e) => return e.into_response(),
     };
     // Agent exists (400 above) but no provider model is configured → 503.
     // `resolved_model_provider_for_agent` returns None when the agent has no
@@ -1036,7 +1074,7 @@ pub(crate) async fn handle_chat_completions(
     // ── ⑤ session key ───────────────────────────────────────────────────
     let (session_key, had_header) = match extract_session_key(&headers) {
         Ok(key) => key,
-        Err(response) => return response,
+        Err(e) => return e.into_response(),
     };
     // Every error from here on echoes the complete key.
     let session_key_echo = session_key.clone();
@@ -1201,7 +1239,7 @@ pub(crate) async fn handle_chat_completions(
         ToolChoiceMode::None => agent.disable_tools(),
         ToolChoiceMode::Auto => {
             match resolve_tool_specs(&request.tool_choice, &request.tools, &configured) {
-                Err(resp) => return add_session_key(resp),
+                Err(e) => return add_session_key(e.into_response()),
                 Ok(Some(specs)) => {
                     if specs.is_empty() {
                         agent.disable_tools();
@@ -1741,8 +1779,7 @@ mod tests {
 
     /// Run both validators; the first rejection wins (unsupported params
     /// checked before message-level validation).
-    #[allow(clippy::result_large_err)]
-    fn run_validators(req: &ChatCompletionRequest) -> Result<(), Response> {
+        fn run_validators(req: &ChatCompletionRequest) -> Result<(), ApiError> {
         validate_unsupported_params(req).and_then(|_| validate_request(req))
     }
 
@@ -1756,7 +1793,7 @@ mod tests {
     async fn assert_rejected(req: serde_json::Value, expected_param: &str) {
         let r = parse_request(req);
         let err = run_validators(&r).unwrap_err();
-        let (status, body) = response_json(err).await;
+        let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], expected_param);
@@ -1885,7 +1922,7 @@ mod tests {
         });
         let r = parse_request(v);
         let err = run_validators(&r).unwrap_err();
-        let (status, body) = response_json(err).await;
+        let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "messages");
@@ -1903,7 +1940,7 @@ mod tests {
         });
         let r = parse_request(v);
         let err = run_validators(&r).unwrap_err();
-        let (status, body) = response_json(err).await;
+        let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "messages");
@@ -1920,7 +1957,7 @@ mod tests {
         });
         let r = parse_request(v);
         let err = run_validators(&r).unwrap_err();
-        let (status, body) = response_json(err).await;
+        let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "messages");
@@ -1945,7 +1982,7 @@ mod tests {
         });
         let r = parse_request(v);
         let err = run_validators(&r).unwrap_err();
-        let (status, body) = response_json(err).await;
+        let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "messages");
@@ -1962,7 +1999,7 @@ mod tests {
         });
         let r = parse_request(v);
         let err = run_validators(&r).unwrap_err();
-        let (_, body) = response_json(err).await;
+        let (_, body) = response_json(err.into_response()).await;
         assert_eq!(body["error"]["param"], "messages");
         let msg = body["error"]["message"].as_str().unwrap();
         assert!(msg.contains("messages[0].name"));
@@ -1974,7 +2011,7 @@ mod tests {
         });
         let r2 = parse_request(v2);
         let err2 = run_validators(&r2).unwrap_err();
-        let (_, body2) = response_json(err2).await;
+        let (_, body2) = response_json(err2.into_response()).await;
         assert_eq!(body2["error"]["param"], "messages");
         let msg2 = body2["error"]["message"].as_str().unwrap();
         assert!(msg2.contains("messages[0].tool_call_id"));
@@ -1985,7 +2022,7 @@ mod tests {
         let v = json!({"model": "gpt-4o", "messages": []});
         let r = parse_request(v);
         let err = run_validators(&r).unwrap_err();
-        let (status, body) = response_json(err).await;
+        let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "messages");
@@ -1998,7 +2035,7 @@ mod tests {
         v["max_tokens"] = json!(1);
         let r = parse_request(v);
         let err = run_validators(&r).unwrap_err();
-        let (status, body) = response_json(err).await;
+        let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"]["message"].is_string());
         assert_eq!(body["error"]["type"], "invalid_request_error");
@@ -2065,7 +2102,7 @@ mod tests {
         });
         let r = parse_request(v);
         let err = run_validators(&r).unwrap_err();
-        let (_, body) = response_json(err).await;
+        let (_, body) = response_json(err.into_response()).await;
         let msg = body["error"]["message"].as_str().unwrap();
         assert!(msg.contains("messages[1].role"));
     }
@@ -2080,7 +2117,7 @@ mod tests {
         });
         let r = parse_request(v);
         let err = run_validators(&r).unwrap_err();
-        let (_, body) = response_json(err).await;
+        let (_, body) = response_json(err.into_response()).await;
         let msg = body["error"]["message"].as_str().unwrap();
         assert!(msg.contains("messages[0].name"));
         assert!(!msg.contains("messages[0].role"));
@@ -2223,7 +2260,7 @@ mod tests {
     async fn unknown_alias_400_in_handler() {
         let config = config_with_agents(&[("coding", true)]);
         let err = resolve_agent_alias_from_model("zeroclaw/nope", &config).unwrap_err();
-        let (status, body) = response_json(err).await;
+        let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "model");
@@ -3371,7 +3408,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         v["tool_choice"] = json!({"type": "function", "function": {"name": "web_search"}});
         let r = parse_request(v);
         let err = run_validators(&r).unwrap_err();
-        let (status, body) = response_json(err).await;
+        let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "unsupported_parameter");
         assert_eq!(body["error"]["param"], "tool_choice");
@@ -3471,7 +3508,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn empty_tools_400() {
         let err = resolve_tool_specs(&None, &Some(Vec::new()), &configured_tools()).unwrap_err();
-        let (status, body) = response_json(err).await;
+        let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "tools");
@@ -3485,7 +3522,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn unknown_tool_400() {
         let tools = Some(tool_requests(&["nope"]));
         let err = resolve_tool_specs(&None, &tools, &configured_tools()).unwrap_err();
-        let (status, body) = response_json(err).await;
+        let (status, body) = response_json(err.into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["param"], "tools");
         assert!(body["error"]["message"]
