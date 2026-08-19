@@ -65,6 +65,7 @@ pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
 
+use zeroclaw_api::TOOL_SPECS_OVERRIDE;
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
 use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
@@ -715,13 +716,27 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
-        let mut iteration_tool_specs = build_iteration_tool_specs(
-            model_provider,
-            model,
-            tools_registry,
-            excluded_tools,
-            activated_tools,
-        )?;
+        // When TOOL_SPECS_OVERRIDE is Some, the turn is request-scoped
+        // (chat-completions `tools` parameter). On default paths the override
+        // is absent — the full agent tool set is available, and the
+        // per-iteration rebuild (including activated/deferred tools) runs
+        // normally. `from_override` is a frozen snapshot: it does not consult
+        // the activated-tool set or re-collect from the registry.
+        let mut iteration_tool_specs =
+            match TOOL_SPECS_OVERRIDE.try_with(Clone::clone).ok().flatten() {
+                Some(override_specs) => IterationToolSpecs::from_override(
+                    model_provider,
+                    &override_specs,
+                    excluded_tools,
+                ),
+                None => build_iteration_tool_specs(
+                    model_provider,
+                    model,
+                    tools_registry,
+                    excluded_tools,
+                    activated_tools,
+                )?,
+            };
 
         let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
             config,

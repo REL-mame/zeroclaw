@@ -2070,7 +2070,7 @@ pub async fn run_gateway(
     #[cfg(feature = "a2a")]
     let long_running_router = long_running_router.merge(a2a::a2a_task_route());
     let long_running_router: Router = long_running_router
-        .with_state(state)
+        .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -2078,6 +2078,17 @@ pub async fn run_gateway(
         ));
 
     let inner = inner.merge(long_running_router);
+
+    // Chat-completions router, parallel to long_running_router (own layers,
+    // no gateway-wide timeout — the turn runner's cooperative deadline owns
+    // hangs). Disabled by default; set gateway.chat_completions_enabled = true
+    // to expose. `state` (now moved into this router) is the last use of the
+    // original; `long_running_router` took a clone above.
+    let chat_completions_router = api_chat_completions::build_chat_completions_router(
+        state,
+        config.gateway.chat_completions_enabled,
+    );
+    let inner = inner.merge(chat_completions_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"

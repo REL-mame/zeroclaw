@@ -5,6 +5,7 @@
 //! (added incrementally) agent routing, handler orchestration, SSE/JSON
 //! dispatch, and the tool whitelist.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,10 +16,14 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
+use axum::routing::post;
+use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
+use tower_http::limit::RequestBodyLimitLayer;
 use zeroclaw_api::session_keys::sanitize_session_key;
+use zeroclaw_api::tool::ToolSpec;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::ClaimOutcome;
 use zeroclaw_infra::session_queue::{SessionGuard, SessionQueueError};
@@ -424,8 +429,9 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
 /// all use `param = "messages"` with the fine-grained index in the message
 /// text.
 ///
-/// `tools`/`tool_choice` deep validation is handled in a later step and is
-/// not done here.
+/// `tools` shape checks and the `tool_choice` shape gate run at the end of
+/// this function (R9); the name→authoritative-spec mapping itself happens in
+/// the handler where the agent's tool directory is available.
 #[allow(clippy::result_large_err)]
 fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
     if req.messages.is_empty() {
@@ -486,7 +492,167 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
             ));
         }
     }
+
+    // ── tools: shape only (name allow-list resolution lives in the handler) ──
+    if let Some(ref tools) = req.tools {
+        for tool in tools {
+            if tool.kind != "function" {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "Only 'function' tool type is supported",
+                    None,
+                    Some("tools"),
+                ));
+            }
+            if tool.function.name.trim().is_empty() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "tool.function.name is required",
+                    None,
+                    Some("tools"),
+                ));
+            }
+        }
+    }
+
+    // ── tool_choice: front-loaded so `"required"` / specific-function /
+    //    malformed shapes are rejected here, before `parse_tool_choice`
+    //    (which therefore only ever sees `auto`/`none`/absent).
+    if let Some(ref tc) = req.tool_choice {
+        match tc {
+            serde_json::Value::String(s) if s == "auto" || s == "none" => {}
+            // A function object is a recognized-but-unsupported shape; it gets
+            // `unsupported_parameter` (parameter supported, value not), while
+            // malformed shapes stay `invalid_request_error`.
+            serde_json::Value::Object(_) => {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_parameter",
+                    "specific-function tool_choice is not supported; use \"auto\" or \"none\"",
+                    None,
+                    Some("tool_choice"),
+                ));
+            }
+            _ => {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "tool_choice supports only \"auto\" or \"none\"",
+                    None,
+                    Some("tool_choice"),
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+/// The two reachable `tool_choice` modes after `validate_request`'s shape
+/// gate: absent / `"auto"` → `Auto`; `"none"` → `None`. Everything else was
+/// already rejected up front, so there is no `Required` / specific-function
+/// variant to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolChoiceMode {
+    Auto,
+    None,
+}
+
+/// Parse `tool_choice` into a mode. Safe to call only after `validate_request`
+/// (which rejects every shape outside `"auto"`/`"none"`/absent); the default
+/// arm is defense-in-depth for absent / unexpected values.
+fn parse_tool_choice(value: &Option<serde_json::Value>) -> ToolChoiceMode {
+    match value {
+        Some(v) if v.as_str() == Some("none") => ToolChoiceMode::None,
+        _ => ToolChoiceMode::Auto,
+    }
+}
+
+/// Resolve the authoritative server spec for each requested tool, preserving
+/// the client's request order. Callers must have already rejected any name not
+/// present in `configured`, so every lookup succeeds; the client's
+/// description/parameters are intentionally ignored (schema forgery guard).
+/// When a client attached a schema that differs from the authoritative one, a
+/// WARN audit record is emitted but the authoritative spec is still used.
+fn authoritative_specs_for(
+    requested: &[ChatCompletionTool],
+    configured: &HashMap<String, ToolSpec>,
+) -> Vec<ToolSpec> {
+    requested
+        .iter()
+        .filter_map(|tool| {
+            let authoritative = configured.get(&tool.function.name)?;
+            // Client-supplied description/parameters are never used; log
+            // mismatches as audit signal. A missing/null client description
+            // against an authoritative one counts as a mismatch.
+            let desc_differs = tool
+                .function
+                .description
+                .as_deref()
+                .is_none_or(|c| c != authoritative.description);
+            let schema_differs = desc_differs
+                || (!tool.function.parameters.is_null()
+                    && tool.function.parameters != *authoritative.parameters);
+            if schema_differs {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_attrs(::serde_json::json!({ "tool": tool.function.name })),
+                    "client-supplied tool schema differs from authoritative Tool::spec(); using server spec"
+                );
+            }
+            Some(authoritative.clone())
+        })
+        .collect()
+}
+
+/// Map a validated `tools` allow-list to authoritative server specs.
+///
+/// `tool_choice` here has already passed `validate_request`, so only
+/// `auto`/`none`/absent are reachable. `none` → empty override (the caller
+/// disables tools); `auto` with no `tools` → `Ok(None)` = the default agent
+/// tool set; `auto` with an allow-list → name-only whitelist resolution
+/// (unknown names are a fail-closed 400, empty lists are rejected).
+#[allow(clippy::result_large_err)]
+fn resolve_tool_specs(
+    tool_choice: &Option<serde_json::Value>,
+    tools: &Option<Vec<ChatCompletionTool>>,
+    configured: &HashMap<String, ToolSpec>,
+) -> Result<Option<Vec<ToolSpec>>, Response> {
+    match parse_tool_choice(tool_choice) {
+        ToolChoiceMode::None => Ok(Some(Vec::new())),
+        ToolChoiceMode::Auto => match tools {
+            None => Ok(None),
+            Some(requested) => {
+                if requested.is_empty() {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "tools list must not be empty",
+                        None,
+                        Some("tools"),
+                    ));
+                }
+                let unknown: Vec<&str> = requested
+                    .iter()
+                    .filter(|t| !configured.contains_key(&t.function.name))
+                    .map(|t| t.function.name.as_str())
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        &format!("Unknown tool(s): {}", unknown.join(", ")),
+                        None,
+                        Some("tools"),
+                    ));
+                }
+                Ok(Some(authoritative_specs_for(requested, configured)))
+            }
+        },
+    }
 }
 
 // ── Agent routing (model → alias) ───────────────────────────────────────────
@@ -747,13 +913,47 @@ fn add_rate_limit_headers(mut response: Response, decision: &RateLimitDecision) 
     response
 }
 
+/// Rewrite the body-size 413 emitted by `RequestBodyLimitLayer` into the
+/// OpenAI-compatible error envelope, so an oversized body stays JSON.
+async fn rewrite_payload_too_large(response: Response) -> Response {
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            &format!(
+                "Request body exceeds the {} byte limit",
+                crate::MAX_BODY_SIZE
+            ),
+            None,
+            None,
+        )
+    } else {
+        response
+    }
+}
+
+/// Build `/v1/chat/completions`. When `enabled` is false the route is absent
+/// (POST then yields 405, the gateway's existing missing-path behavior);
+/// the body-size limit and 413 rewrite always apply.
+/// Shared by production wiring and tests so neither drifts from the other.
+pub(crate) fn build_chat_completions_router(state: AppState, enabled: bool) -> Router {
+    let router: Router<AppState> = if enabled {
+        Router::new().route("/v1/chat/completions", post(handle_chat_completions))
+    } else {
+        Router::new()
+    };
+    router
+        .with_state(state)
+        .layer(RequestBodyLimitLayer::new(crate::MAX_BODY_SIZE))
+        .layer(axum::middleware::map_response(rewrite_payload_too_large))
+}
+
 /// `POST /v1/chat/completions` handler: the 12-step orchestration.
 ///
 /// Steps 1–4 run before the session key is known and do not echo it; from step
-/// 5 onward every error echoes the complete `x-session-key`. Steps 11 (tool
-/// whitelist) and 12 (dispatch) delegate to later milestones / the transports.
-/// `#[allow(dead_code)]` until the router mounts this handler.
-#[allow(dead_code, clippy::result_large_err)]
+/// 5 onward every error echoes the complete `x-session-key`. Step 11 (tool
+/// whitelist) and step 12 (dispatch) close the orchestration.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn handle_chat_completions(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -963,11 +1163,6 @@ pub(crate) async fn handle_chat_completions(
         .await
         .unwrap_or_default(); // graceful degradation; the turn continues without memory
 
-    // ── ⑪ tools ─────────────────────────────────────────────────────────
-    // Whitelist validation (`resolve_tool_specs`/`parse_tool_choice`) lands in
-    // a later milestone; requests carrying `tools`/`tool_choice` are currently
-    // executed transparently.
-
     // ── ⑫ dispatch ──────────────────────────────────────────────────────
     let (history, current_turn) = split_messages(&request.messages);
     let mut agent =
@@ -989,6 +1184,34 @@ pub(crate) async fn handle_chat_completions(
         agent.seed_history(&stored_messages);
     } else if !history.is_empty() {
         agent.seed_history(&history);
+    }
+
+    // ── ⑪ tools ─────────────────────────────────────────────────────────
+    // `tool_choice` shape was already gated in `validate_request`; here we
+    // map the name allow-list to authoritative `Tool::spec()`s and scope them
+    // onto the per-request agent (propagated to the turn + delegate spawns via
+    // `TOOL_SPECS_OVERRIDE`). `tool_choice: "none"` disables all tools; absent
+    // `tools` with `auto` leaves the default agent tool set untouched.
+    let configured: HashMap<String, ToolSpec> = agent
+        .get_configured_tool_specs()
+        .into_iter()
+        .map(|spec| (spec.name.clone(), spec))
+        .collect();
+    match parse_tool_choice(&request.tool_choice) {
+        ToolChoiceMode::None => agent.disable_tools(),
+        ToolChoiceMode::Auto => {
+            match resolve_tool_specs(&request.tool_choice, &request.tools, &configured) {
+                Err(resp) => return add_session_key(resp),
+                Ok(Some(specs)) => {
+                    if specs.is_empty() {
+                        agent.disable_tools();
+                    } else {
+                        agent.set_tool_specs(specs);
+                    }
+                }
+                Ok(None) => {} // default tool set; leave the agent untouched
+            }
+        }
     }
 
     let include_usage = request
@@ -1506,8 +1729,11 @@ fn stream_error_event(error_type: &str, status: u16, message: &str) -> Event {
 mod tests {
     use super::*;
     use crate::api::test_state;
+    use axum::body::Body;
+    use axum::http::Request;
     use http_body_util::BodyExt;
     use serde_json::json;
+    use tower::ServiceExt;
 
     fn parse_request(v: serde_json::Value) -> ChatCompletionRequest {
         serde_json::from_value(v).expect("request must deserialize")
@@ -3125,5 +3351,251 @@ data: {\"type\":\"message_stop\"}\n\n";
             "tool names/arguments must not leak into the stream: {sse}"
         );
         assert_eq!(frames[frames.len() - 1], "[DONE]");
+    }
+
+    // ── R9: tool whitelist + tool_choice ───────────────────────────────
+
+    #[tokio::test]
+    async fn rejects_tool_choice_required() {
+        let mut v = base_request();
+        v["tool_choice"] = json!("required");
+        assert_rejected(v, "tool_choice").await;
+    }
+
+    #[tokio::test]
+    async fn rejects_tool_choice_named_function() {
+        // A specific-function object is a recognized-but-unsupported shape: it
+        // gets `unsupported_parameter` (parameter supported, value not),
+        // unlike malformed shapes which stay `invalid_request_error`.
+        let mut v = base_request();
+        v["tool_choice"] = json!({"type": "function", "function": {"name": "web_search"}});
+        let r = parse_request(v);
+        let err = run_validators(&r).unwrap_err();
+        let (status, body) = response_json(err).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "unsupported_parameter");
+        assert_eq!(body["error"]["param"], "tool_choice");
+    }
+
+    #[tokio::test]
+    async fn rejects_tool_choice_malformed() {
+        for val in [json!(1), json!([1]), json!(true)] {
+            let mut v = base_request();
+            v["tool_choice"] = val;
+            assert_rejected(v, "tool_choice").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_choice_null_means_absent() {
+        // `null` deserializes to `None`, identical to an absent field: the
+        // default `auto` mode with the full agent tool set.
+        let mut v = base_request();
+        v["tool_choice"] = json!(null);
+        let r = parse_request(v);
+        assert!(r.tool_choice.is_none(), "null must behave as absent");
+        run_validators(&r).expect("null tool_choice must pass the shape gate");
+    }
+
+    #[tokio::test]
+    async fn accepts_tool_choice_auto_and_none() {
+        for val in [json!("auto"), json!("none")] {
+            let mut v = base_request();
+            v["tool_choice"] = val;
+            let r = parse_request(v);
+            run_validators(&r).expect("auto/none must pass the shape gate");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_tool_kind_non_function() {
+        let mut v = base_request();
+        v["tools"] = json!([{"type": "web_search", "function": {"name": "x"}}]);
+        assert_rejected(v, "tools").await;
+    }
+
+    #[tokio::test]
+    async fn rejects_tool_with_empty_name() {
+        let mut v = base_request();
+        v["tools"] = json!([{"type": "function", "function": {"name": "  "}}]);
+        assert_rejected(v, "tools").await;
+    }
+
+    fn configured_tools() -> HashMap<String, ToolSpec> {
+        let mut map = HashMap::new();
+        for (name, desc) in [("alpha", "Alpha does A"), ("beta", "Beta does B")] {
+            map.insert(name.to_string(), ToolSpec::new(name, desc, json!({"type": "object"})));
+        }
+        map
+    }
+
+    fn tool_requests(names: &[&str]) -> Vec<ChatCompletionTool> {
+        names
+            .iter()
+            .map(|n| ChatCompletionTool {
+                kind: "function".into(),
+                function: ToolFunction {
+                    name: n.to_string(),
+                    // Client-supplied schema deliberately differs from the
+                    // authoritative spec so `authoritative_specs_for` emits a
+                    // WARN audit and still returns the server spec.
+                    description: Some("client description".into()),
+                    parameters: json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_tool_choice_auto_and_none() {
+        assert_eq!(parse_tool_choice(&None), ToolChoiceMode::Auto);
+        assert_eq!(parse_tool_choice(&Some(json!("auto"))), ToolChoiceMode::Auto);
+        assert_eq!(parse_tool_choice(&Some(json!("none"))), ToolChoiceMode::None);
+    }
+
+    #[test]
+    fn tool_choice_none_returns_empty_override() {
+        let specs = resolve_tool_specs(&Some(json!("none")), &None, &configured_tools())
+            .expect("none must resolve")
+            .expect("none must yield an override");
+        assert!(specs.is_empty(), "tool_choice=none disables every tool");
+    }
+
+    #[test]
+    fn tool_choice_auto_without_tools_returns_none() {
+        let specs = resolve_tool_specs(&None, &None, &configured_tools())
+            .expect("auto + no tools must resolve");
+        assert!(specs.is_none(), "default tool set, not an override");
+    }
+
+    #[tokio::test]
+    async fn empty_tools_400() {
+        let err = resolve_tool_specs(&None, &Some(Vec::new()), &configured_tools()).unwrap_err();
+        let (status, body) = response_json(err).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "tools");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_400() {
+        let tools = Some(tool_requests(&["nope"]));
+        let err = resolve_tool_specs(&None, &tools, &configured_tools()).unwrap_err();
+        let (status, body) = response_json(err).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["param"], "tools");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown tool(s): nope"));
+    }
+
+    #[test]
+    fn authoritative_spec_wins_and_preserves_request_order() {
+        // Client asks [beta, alpha] with forged schemas; the response must
+        // come back in the same order but with the authoritative specs.
+        let tools = Some(tool_requests(&["beta", "alpha"]));
+        let specs = resolve_tool_specs(&None, &tools, &configured_tools())
+            .expect("known names must resolve")
+            .expect("allow-list override");
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["beta", "alpha"], "request order preserved");
+        assert_eq!(specs[0].description, "Beta does B");
+        assert_eq!(specs[0].parameters.as_ref(), &json!({"type": "object"}));
+    }
+
+    #[test]
+    fn name_collision_selects_server_spec() {
+        let tools = Some(tool_requests(&["alpha"]));
+        let specs = resolve_tool_specs(&None, &tools, &configured_tools())
+            .expect("known name must resolve")
+            .expect("override");
+        assert_eq!(
+            specs[0].description, "Alpha does A",
+            "server spec wins over the client-supplied description"
+        );
+        assert_eq!(
+            specs[0].parameters.as_ref(),
+            &json!({"type": "object"}),
+            "server schema wins over the client-supplied schema"
+        );
+    }
+
+    // ── R5b: router mount + 413 rewrite ─────────────────────────────────
+
+    #[tokio::test]
+    async fn chat_completions_route_absent_when_disabled() {
+        // A standalone disabled router carries no route; a merged-in empty
+        // router yields the gateway's existing 405 for unknown POST paths.
+        let router = build_chat_completions_router(test_state(Config::default()), false);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_route_mounted_when_enabled() {
+        let router = build_chat_completions_router(test_state(Config::default()), true);
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    // The handler's `ConnectInfo` extractor requires the
+                    // extension; axum's `oneshot` does not populate it.
+                    .extension(ConnectInfo(addr))
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The handler runs (route mounted): its first step — body serde parse —
+        // fails on the missing `messages`, so the OpenAI-compatible 400 envelope
+        // comes back instead of 404/405.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn rewrite_payload_too_large_returns_json_envelope() {
+        let response = rewrite_payload_too_large(
+            Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let (_, body) = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["status"], 413);
+        assert_eq!(
+            body["error"]["message"].as_str().unwrap(),
+            format!("Request body exceeds the {} byte limit", crate::MAX_BODY_SIZE)
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_payload_too_large_passes_through_other_statuses() {
+        let response = rewrite_payload_too_large(
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
