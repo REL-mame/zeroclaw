@@ -2079,11 +2079,9 @@ pub async fn run_gateway(
 
     let inner = inner.merge(long_running_router);
 
-    // Chat-completions router, parallel to long_running_router (own layers,
-    // no gateway-wide timeout — the turn runner's cooperative deadline owns
-    // hangs). Disabled by default; set gateway.chat_completions_enabled = true
-    // to expose. `state` (now moved into this router) is the last use of the
-    // original; `long_running_router` took a clone above.
+    // Chat-completions router, parallel to long_running_router (own layers, no
+    // gateway-wide timeout — the turn runner's cooperative deadline owns hangs).
+    // Disabled by default; set gateway.chat_completions_enabled = true to expose.
     let chat_completions_router = api_chat_completions::build_chat_completions_router(
         state,
         config.gateway.chat_completions_enabled,

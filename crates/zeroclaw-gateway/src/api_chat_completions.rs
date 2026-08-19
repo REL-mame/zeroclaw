@@ -1,9 +1,8 @@
 //! OpenAI-compatible `POST /v1/chat/completions` adapter.
 //!
 //! This module owns the chat-completions wire contract: request/response
-//! types, the OpenAI-compatible error envelope, request validation, and
-//! (added incrementally) agent routing, handler orchestration, SSE/JSON
-//! dispatch, and the tool whitelist.
+//! types, the OpenAI-compatible error envelope, request validation, agent
+//! routing, handler orchestration, SSE/JSON dispatch, and the tool whitelist.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -130,10 +129,10 @@ pub struct FunctionCall {
 
 // ── Response wire types ─────────────────────────────────────────────────────
 
-// Constructed by `blocking_mode`; defined here so the wire contract is fixed
-// before orchestration lands. `tool_calls` is always `None` under transparent
-// execution, so the `ResponseToolCall`/`ResponseFunctionCall` shapes below are
-// only referenced by `#[serde(skip_serializing_if)]` and stay `#[allow(dead_code)]`.
+// Constructed by `blocking_mode`. `tool_calls` is always `None` under
+// transparent execution, so the `ResponseToolCall`/`ResponseFunctionCall`
+// shapes below are only referenced by `#[serde(skip_serializing_if)]` and stay
+// `#[allow(dead_code)]`.
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -473,7 +472,7 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), ApiErr
 /// text.
 ///
 /// `tools` shape checks and the `tool_choice` shape gate run at the end of
-/// this function (R9); the name→authoritative-spec mapping itself happens in
+/// this function; the name→authoritative-spec mapping itself happens in
 /// the handler where the agent's tool directory is available.
 fn validate_request(req: &ChatCompletionRequest) -> Result<(), ApiError> {
     if req.messages.is_empty() {
@@ -3390,7 +3389,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(frames[frames.len() - 1], "[DONE]");
     }
 
-    // ── R9: tool whitelist + tool_choice ───────────────────────────────
+    // ── Tool whitelist + tool_choice ───────────────────────────────
 
     #[tokio::test]
     async fn rejects_tool_choice_required() {
@@ -3562,7 +3561,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
-    // ── R5b: router mount + 413 rewrite ─────────────────────────────────
+    // ── Router mount + 413 rewrite ──────────────────────────────────────
 
     #[tokio::test]
     async fn chat_completions_route_absent_when_disabled() {

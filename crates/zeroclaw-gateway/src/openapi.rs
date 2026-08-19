@@ -50,8 +50,7 @@ pub async fn handle_docs() -> Response {
 /// surface that is documented today (`/api/config/*`). The chat-completions
 /// contract is included only while `gateway.chat_completions_enabled` is set,
 /// so the document never advertises an endpoint that would 405.
-/// Cached per enabled-state; refreshing the runtime flag requires a restart
-/// (the same snapshot-vs-config tradeoff the previous per-build cache made).
+/// Cached per enabled-state; refreshing the runtime flag requires a restart.
 pub async fn handle_openapi_json(State(state): State<AppState>) -> Response {
     let enabled = state.config.read().gateway.chat_completions_enabled;
     let body = if enabled {
