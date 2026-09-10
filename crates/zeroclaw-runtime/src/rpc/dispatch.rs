@@ -3214,7 +3214,7 @@ impl RpcDispatcher {
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-// Reject noncanonical caller-supplied session ids before any backend
+        // Reject noncanonical caller-supplied session ids before any backend
         // keying or permit acquisition (see ensure_canonical_session_id).
         // Auto-generated UUIDs are always canonical, so this only affects
         // explicit ids.
