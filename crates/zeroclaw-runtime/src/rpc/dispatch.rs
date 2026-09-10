@@ -3222,16 +3222,6 @@ impl RpcDispatcher {
             ensure_canonical_session_id(&session_id)?;
         }
 
-        // Session replacement and prompt execution share one admission
-        // permit. Resolve and install the new incarnation only after the
-        // previous same-ID turn has fully finalized its durable state.
-        let _guard = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(&session_id)
-            .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
         let config = self.ctx.config.read().clone();
         let chat_mode = req
             .chat_mode
