@@ -68,7 +68,8 @@ impl SqliteSessionBackend {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
-             PRAGMA mmap_size = 4194304;",
+             PRAGMA mmap_size = 4194304;
+             PRAGMA busy_timeout = 5000;",
         )?;
 
         conn.execute_batch(
@@ -1431,31 +1432,44 @@ impl SessionBackend for SqliteSessionBackend {
                     return Ok(ClaimOutcome::NeedsMigration);
                 }
                 // Empty new session. Insert the row if missing, and set the
-                // owner only when still NULL — the WHERE guard makes a lost
-                // update impossible even though we already hold the lock.
+                // owner only when the row is still ownerless AND still carries
+                // no transcript. The WHERE guard re-checks both conditions in
+                // the same statement the owner is written, so a concurrent
+                // append (a first message arriving under an independent
+                // connection after the probe above) can never be silently
+                // claimed — the write either lands atomically with its
+                // preconditions or is skipped.
                 let now = Utc::now().to_rfc3339();
                 let affected = conn
                     .execute(
                         "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
                          VALUES (?1, ?2, ?3, 0, ?4)
                          ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias
-                         WHERE session_metadata.agent_alias IS NULL",
+                         WHERE session_metadata.agent_alias IS NULL
+                           AND NOT EXISTS (SELECT 1 FROM sessions WHERE session_key = excluded.session_key)",
                         params![session_key, now, now, agent_alias],
                     )
                     .map_err(std::io::Error::other)?;
                 if affected == 0 {
-                    // The UPDATE was blocked (owner already set elsewhere); re-read the winner.
-                    match conn.query_row(
-                        "SELECT agent_alias FROM session_metadata WHERE session_key = ?1",
-                        params![session_key],
-                        |row| row.get(0),
-                    ) {
-                        Ok(winner) => Ok(ClaimOutcome::Conflict(winner)),
-                        Err(rusqlite::Error::QueryReturnedNoRows) => {
-                            // Session deleted between UPSERT and SELECT → treat as claimed.
-                            Ok(ClaimOutcome::Claimed)
-                        }
-                        Err(e) => Err(std::io::Error::other(e)),
+                    // The guarded write was skipped: a conflicting owner or a
+                    // transcript appeared after the probe. Re-read to tell
+                    // exactly which precondition broke.
+                    let state: Option<(String, bool)> = conn
+                        .query_row(
+                            "SELECT COALESCE(agent_alias, ''),
+                                    EXISTS(SELECT 1 FROM sessions WHERE session_key = ?1)
+                             FROM session_metadata WHERE session_key = ?1",
+                            params![session_key],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()
+                        .map_err(std::io::Error::other)?;
+                    match state {
+                        Some((owner, _)) if !owner.is_empty() => Ok(ClaimOutcome::Conflict(owner)),
+                        Some((_, true)) => Ok(ClaimOutcome::NeedsMigration),
+                        // Ownerless and empty (or the metadata row was deleted
+                        // concurrently): nothing to attach, treat as claimed.
+                        Some((_, false)) | None => Ok(ClaimOutcome::Claimed),
                     }
                 } else {
                     Ok(ClaimOutcome::Claimed)
@@ -1490,52 +1504,123 @@ impl SessionBackend for SqliteSessionBackend {
             Some(ref owner) if owner != agent_alias => Ok(AdoptOutcome::Conflict(owner.clone())),
             Some(_) => Ok(AdoptOutcome::Adopted),
             None => {
-                // Confirm the session actually exists before adopting. A
-                // deleted session (no metadata row and no message rows) must
-                // resolve to `Missing` so the CLI never ghosts a metadata row
-                // for a key that now holds nothing (TOCTOU against a concurrent
-                // delete between the CLI preflight and this adoption).
-                let row_exists: i64 = conn
-                    .query_row(
-                        "SELECT (SELECT COUNT(1) FROM session_metadata WHERE session_key = ?1)
-                              + (SELECT COUNT(1) FROM sessions WHERE session_key = ?1)",
-                        params![session_key],
-                        |row| row.get(0),
-                    )
+                // The session has no recorded owner, so attaching one needs a
+                // write. Take the database write lock so the presence check and
+                // the conditional write share one atomic unit with any
+                // concurrent append / delete on an independent connection —
+                // closing the adoption-vs-delete TOCTOU. (`busy_timeout` set at
+                // open makes this wait through a competing writer.)
+                conn.execute_batch("BEGIN IMMEDIATE")
                     .map_err(std::io::Error::other)?;
-                if row_exists == 0 {
-                    return Ok(AdoptOutcome::Missing);
-                }
-                // Ownerless session (empty or carrying history) → adopt. The
-                // WHERE guard makes a concurrent adoption / claim by another
-                // caller lose exactly one, never both.
-                let now = Utc::now().to_rfc3339();
-                let affected = conn
-                    .execute(
-                        "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
-                         VALUES (?1, ?2, ?3, 0, ?4)
-                         ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias
-                         WHERE session_metadata.agent_alias IS NULL",
-                        params![session_key, now, now, agent_alias],
-                    )
-                    .map_err(std::io::Error::other)?;
-                if affected == 0 {
-                    // Lost the race: another caller adopted first. Re-read the
-                    // winner, or the session was deleted concurrently.
-                    match conn.query_row(
-                        "SELECT agent_alias FROM session_metadata WHERE session_key = ?1",
-                        params![session_key],
-                        |row| row.get(0),
-                    ) {
-                        Ok(winner) => Ok(AdoptOutcome::Conflict(winner)),
-                        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(AdoptOutcome::Missing),
-                        Err(e) => Err(std::io::Error::other(e)),
+                // Decide everything inside one closure so any error rolls back
+                // the transaction instead of leaving it dangling on the
+                // connection (a later BEGIN would then fail as nested).
+                let outcome: std::io::Result<AdoptOutcome> = (|| {
+                    // Re-probe the owner under the write lock; a concurrent
+                    // adopter may have won between the outer read and the lock.
+                    // COALESCE normalizes the NULL ownerless cell so reading it
+                    // never surfaces an InvalidColumnType error.
+                    let owner_now: Option<String> = conn
+                        .query_row(
+                            "SELECT COALESCE(agent_alias, '')
+                             FROM session_metadata WHERE session_key = ?1",
+                            params![session_key],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(std::io::Error::other)?;
+                    match owner_now {
+                        Some(owner) if !owner.is_empty() && owner != agent_alias => {
+                            Ok(AdoptOutcome::Conflict(owner))
+                        }
+                        Some(owner) if owner == agent_alias => Ok(AdoptOutcome::Adopted),
+                        _ => {
+                            // Still unowned: decide from what actually exists.
+                            let has_meta: i64 = conn
+                                .query_row(
+                                    "SELECT COUNT(1) FROM session_metadata WHERE session_key = ?1",
+                                    params![session_key],
+                                    |row| row.get(0),
+                                )
+                                .map_err(std::io::Error::other)?;
+                            let has_sess: i64 = conn
+                                .query_row(
+                                    "SELECT COUNT(1) FROM sessions WHERE session_key = ?1",
+                                    params![session_key],
+                                    |row| row.get(0),
+                                )
+                                .map_err(std::io::Error::other)?;
+                            if has_meta == 0 && has_sess == 0 {
+                                // Deleted concurrently: never ghost a metadata row.
+                                Ok(AdoptOutcome::Missing)
+                            } else if has_meta > 0 {
+                                // Ownerless metadata row: attach the owner in place.
+                                let now = Utc::now().to_rfc3339();
+                                conn.execute(
+                                    "UPDATE session_metadata
+                                        SET agent_alias = ?2, last_activity = ?3
+                                      WHERE session_key = ?1 AND agent_alias IS NULL",
+                                    params![session_key, agent_alias, now],
+                                )
+                                .map_err(std::io::Error::other)?;
+                                Ok(AdoptOutcome::Adopted)
+                            } else {
+                                // Transcript present but metadata row missing:
+                                // backfill it, then attach the owner.
+                                let now = Utc::now().to_rfc3339();
+                                conn.execute(
+                                    "INSERT INTO session_metadata
+                                         (session_key, created_at, last_activity, message_count, agent_alias)
+                                     VALUES (?1, ?2, ?3,
+                                             (SELECT COUNT(*) FROM sessions WHERE session_key = ?1),
+                                             ?4)",
+                                    params![session_key, now, now, agent_alias],
+                                )
+                                .map_err(std::io::Error::other)?;
+                                Ok(AdoptOutcome::Adopted)
+                            }
+                        }
                     }
-                } else {
-                    Ok(AdoptOutcome::Adopted)
+                })();
+                match &outcome {
+                    Ok(AdoptOutcome::Adopted) => {
+                        conn.execute_batch("COMMIT")
+                            .map_err(std::io::Error::other)?;
+                    }
+                    Ok(AdoptOutcome::Conflict(_)) | Ok(AdoptOutcome::Missing) => {
+                        conn.execute_batch("ROLLBACK")
+                            .map_err(std::io::Error::other)?;
+                    }
+                    Err(_) => {
+                        conn.execute_batch("ROLLBACK")
+                            .map_err(std::io::Error::other)?;
+                    }
                 }
+                outcome
             }
         }
+    }
+
+    fn unclaim_if_ownerless_and_empty(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<bool> {
+        // Rolls back a claim left as an owner-only ghost row when the caller
+        // failed to install the live session. Deletes only a row still owned
+        // by `agent_alias`, still empty, and backed by no transcript — it can
+        // never remove another owner or a session with real content.
+        let conn = self.conn.lock();
+        let affected = conn
+            .execute(
+                "DELETE FROM session_metadata
+                  WHERE session_key = ?1 AND agent_alias = ?2
+                    AND message_count = 0
+                    AND NOT EXISTS (SELECT 1 FROM sessions WHERE session_key = ?1)",
+                params![session_key, agent_alias],
+            )
+            .map_err(std::io::Error::other)?;
+        Ok(affected > 0)
     }
 
     fn supports_atomic_claim(&self) -> bool {
@@ -3279,6 +3364,139 @@ mod tests {
         assert!(
             owner == Some("alice".to_string()) || owner == Some("bob".to_string()),
             "owner must be one of the racers: {owner:?}"
+        );
+    }
+
+    #[test]
+    fn claim_races_concurrent_first_append_stays_safe() {
+        use crate::session_backend::ClaimOutcome;
+        let tmp = TempDir::new().unwrap();
+        // A claim on one live store racing the first append on another
+        // independent connection. If the append lands between the claim's
+        // history probe and its owned write, the guarded WHERE must fall
+        // through to NeedsMigration instead of silently Claimed (which would
+        // let the claimant read another party's first message as its own).
+        for round in 0..40 {
+            let backend_a = SqliteSessionBackend::new(tmp.path()).unwrap();
+            let backend_b = SqliteSessionBackend::new(tmp.path()).unwrap();
+            let key = format!("race_claim{round}");
+            std::thread::scope(|s| {
+                let a = s.spawn(|| backend_a.claim_session_agent_alias(&key, "alice").unwrap());
+                let b = s.spawn(|| {
+                    backend_b
+                        .append(&key, &ChatMessage::user("first message"))
+                        .unwrap()
+                });
+                let ra = a.join().unwrap();
+                b.join().unwrap();
+                let backend_c = SqliteSessionBackend::new(tmp.path()).unwrap();
+                match ra {
+                    ClaimOutcome::Claimed => {
+                        assert_eq!(
+                            backend_c.get_session_agent_alias(&key).unwrap(),
+                            Some("alice".to_string())
+                        );
+                    }
+                    ClaimOutcome::NeedsMigration => {
+                        assert_eq!(backend_c.get_session_agent_alias(&key).unwrap(), None);
+                    }
+                    other => panic!("unexpected claim outcome: {other:?}"),
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn adopt_races_concurrent_delete_returns_missing() {
+        use crate::session_backend::AdoptOutcome;
+        let tmp = TempDir::new().unwrap();
+        // Adoption on one connection racing a delete on another. If the delete
+        // lands first, adoption must resolve to Missing and must NOT ghost a
+        // metadata row for a key that now holds nothing.
+        for round in 0..40 {
+            let backend_a = SqliteSessionBackend::new(tmp.path()).unwrap();
+            let backend_b = SqliteSessionBackend::new(tmp.path()).unwrap();
+            let key = format!("race_adopt{round}");
+            backend_a.append(&key, &ChatMessage::user("seed")).unwrap();
+            std::thread::scope(|s| {
+                let a = s.spawn(|| backend_a.adopt_session_agent_alias(&key, "alice").unwrap());
+                let b = s.spawn(|| backend_b.delete_session(&key).unwrap());
+                let ra = a.join().unwrap();
+                b.join().unwrap();
+                let backend_c = SqliteSessionBackend::new(tmp.path()).unwrap();
+                match ra {
+                    AdoptOutcome::Adopted => {
+                        // The adopted owner is either recorded as alice, or the
+                        // concurrent delete removed the empty row afterwards —
+                        // both legitimate. It must never surface a third party.
+                        let owner = backend_c.get_session_agent_alias(&key).unwrap();
+                        if let Some(o) = owner {
+                            assert_eq!(o, "alice", "no third-party owner");
+                        } else {
+                            // Owner gone implies the row/transcript vanished too.
+                            assert!(
+                                backend_c.load(&key).is_empty(),
+                                "no ghost transcript without an owner"
+                            );
+                        }
+                    }
+                    AdoptOutcome::Missing => {
+                        assert!(backend_c.load(&key).is_empty(), "no ghost transcript");
+                        assert_eq!(backend_c.get_session_agent_alias(&key).unwrap(), None);
+                    }
+                    other => panic!("unexpected adopt outcome: {other:?}"),
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn unclaim_if_ownerless_and_empty_removes_only_own_ghost() {
+        use crate::session_backend::ClaimOutcome;
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // A claim leaves an owner-only row on an empty session; rolling it
+        // back with the same alias must remove it.
+        let key = "ghost";
+        assert_eq!(
+            backend.claim_session_agent_alias(key, "alice").unwrap(),
+            ClaimOutcome::Claimed
+        );
+        assert_eq!(
+            backend
+                .unclaim_if_ownerless_and_empty(key, "alice")
+                .unwrap(),
+            true
+        );
+        assert_eq!(backend.get_session_agent_alias(key).unwrap(), None);
+
+        // A row that carries a transcript is no ghost and must be preserved
+        // even for a matching alias.
+        let live = "live";
+        backend.set_session_agent_alias(live, "bob").unwrap();
+        backend.append(live, &ChatMessage::user("hello")).unwrap();
+        assert_eq!(
+            backend.unclaim_if_ownerless_and_empty(live, "bob").unwrap(),
+            false
+        );
+        assert_eq!(
+            backend.get_session_agent_alias(live).unwrap(),
+            Some("bob".to_string())
+        );
+
+        // Another agent's owner must never be removed.
+        let foreign = "foreign";
+        backend.set_session_agent_alias(foreign, "mallory").unwrap();
+        assert_eq!(
+            backend
+                .unclaim_if_ownerless_and_empty(foreign, "alice")
+                .unwrap(),
+            false
+        );
+        assert_eq!(
+            backend.get_session_agent_alias(foreign).unwrap(),
+            Some("mallory".to_string())
         );
     }
 }

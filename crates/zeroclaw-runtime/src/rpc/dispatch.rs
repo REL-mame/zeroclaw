@@ -1444,16 +1444,6 @@ impl RpcDispatcher {
             ensure_canonical_session_id(&session_id)?;
         }
 
-        // Session replacement and prompt execution share one admission
-        // permit. Resolve and install the new incarnation only after the
-        // previous same-ID turn has fully finalized its durable state.
-        let _guard = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(&session_id)
-            .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
         let config = self.ctx.config.read().clone();
         let chat_mode = req
             .chat_mode
@@ -1688,13 +1678,17 @@ impl RpcDispatcher {
 
         // ── Chat-mode ownership admission: BEFORE publish ────────────
         // Prove ownership before `insert` so a caller-controlled id can
-        // never evict a live predecessor; admission failure returns before
-        // any `insert`, so the Chat path needs no rollback. Backends that
-        // cannot track ownership fail closed uniformly (WS / HTTP / RPC),
-        // even for empty sessions.
+        // never evict a live predecessor. Backends that cannot track
+        // ownership fail closed uniformly (WS / HTTP / RPC), even for empty
+        // sessions.
         if matches!(chat_mode, crate::rpc::types::ChatMode::Chat)
             && let Some(ref backend) = self.ctx.session_backend
         {
+            // Pre-flight capacity so a full live store is rejected before the
+            // claim — a rejected claim never persists an owner-only ghost row.
+            if !self.ctx.sessions.has_capacity().await {
+                return Err(rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"));
+            }
             let session_key = format!("rpc_{session_id}");
             match backend.claim_session_agent_alias(&session_key, &req.agent_alias) {
                 Ok(zeroclaw_infra::session_backend::ClaimOutcome::Claimed) => {}
@@ -1735,7 +1729,7 @@ impl RpcDispatcher {
             }
         }
 
-        let inserted_generation = self
+        self
             .ctx
             .sessions
             .insert_if_absent(
@@ -1744,10 +1738,22 @@ impl RpcDispatcher {
                     .with_owner(self.tui_id.clone()),
             )
             .await
-            .map_err(|message| {
+.map_err(|message| {
                 if message == "session already exists" {
                     rpc_err(SESSION_BUSY, "Session resume already in progress")
                 } else {
+                    // Capacity raced the pre-flight check above: the insert
+                    // was rejected after this caller claimed ownership. Remove
+                    // the owner-only ghost row — a conditional delete that
+                    // only touches a row still owned by this agent, still
+                    // empty, with no transcript, so it is a safe no-op for any
+                    // other path.
+                    if let Some(ref backend) = self.ctx.session_backend {
+                        let _ = backend.unclaim_if_ownerless_and_empty(
+                            &format!("rpc_{session_id}"),
+                            &req.agent_alias,
+                        );
+                    }
                     rpc_err(SESSION_LIMIT_REACHED, "Session limit reached")
                 }
             })?;
@@ -1821,9 +1827,10 @@ impl RpcDispatcher {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        self.ctx
+                        let _ = self
+                            .ctx
                             .sessions
-                            .remove_if_generation(&session_id, inserted_generation)
+                            .remove(&session_id)
                             .await;
                         return Err(rpc_err(
                             INTERNAL_ERROR,
@@ -1862,10 +1869,7 @@ impl RpcDispatcher {
                             if let Some(ref hooks) = self.ctx.hooks {
                                 hooks.fire_session_end(&session_id, "rpc").await;
                             }
-                            self.ctx
-                                .sessions
-                                .remove_if_generation(&session_id, inserted_generation)
-                                .await;
+                            self.ctx.sessions.remove(&session_id).await;
                             return Err(rpc_err(
                                 INVALID_PARAMS,
                                 "ACP session belongs to a different agent",
@@ -1904,9 +1908,10 @@ impl RpcDispatcher {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        self.ctx
+                        let _ = self
+                            .ctx
                             .sessions
-                            .remove_if_generation(&session_id, inserted_generation)
+                            .remove(&session_id)
                             .await;
                         return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
                     }
@@ -1914,9 +1919,10 @@ impl RpcDispatcher {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        self.ctx
+                        let _ = self
+                            .ctx
                             .sessions
-                            .remove_if_generation(&session_id, inserted_generation)
+                            .remove(&session_id)
                             .await;
                         ::zeroclaw_log::record!(
                             WARN,
@@ -1934,9 +1940,10 @@ impl RpcDispatcher {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        self.ctx
+                        let _ = self
+                            .ctx
                             .sessions
-                            .remove_if_generation(&session_id, inserted_generation)
+                            .remove(&session_id)
                             .await;
                         ::zeroclaw_log::record!(
                             WARN,

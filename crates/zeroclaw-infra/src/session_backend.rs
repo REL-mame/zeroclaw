@@ -395,6 +395,19 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
+    /// Delete the recorded owner of `session_key` if it is still owned by
+    /// `agent_alias`, still empty, and carries no transcript — rolls back an
+    /// owner-only ghost row left when a caller claims a session but then fails
+    /// to install the live one. Returns whether a row was removed. Defaults to
+    /// `Ok(false)`; only claim-capable backends need to implement it.
+    fn unclaim_if_ownerless_and_empty(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+    ) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
     fn set_session_context(
         &self,
         _session_key: &str,

@@ -200,6 +200,14 @@ impl SessionStore {
         }
     }
 
+    /// Whether a further session can be inserted without exceeding the cap.
+    /// Used by callers to reject at the entry point *before* carrying out any
+    /// side-effectful admission (e.g. an ownership claim), so a full live store
+    /// never leaves an owner-only ghost row behind.
+    pub async fn has_capacity(&self) -> bool {
+        self.sessions.lock().await.len() < self.max_sessions
+    }
+
     pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<u64, &'static str> {
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
