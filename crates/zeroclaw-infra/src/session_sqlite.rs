@@ -3463,11 +3463,10 @@ mod tests {
             backend.claim_session_agent_alias(key, "alice").unwrap(),
             ClaimOutcome::Claimed
         );
-        assert_eq!(
+        assert!(
             backend
                 .unclaim_if_ownerless_and_empty(key, "alice")
-                .unwrap(),
-            true
+                .unwrap()
         );
         assert_eq!(backend.get_session_agent_alias(key).unwrap(), None);
 
@@ -3476,10 +3475,7 @@ mod tests {
         let live = "live";
         backend.set_session_agent_alias(live, "bob").unwrap();
         backend.append(live, &ChatMessage::user("hello")).unwrap();
-        assert_eq!(
-            backend.unclaim_if_ownerless_and_empty(live, "bob").unwrap(),
-            false
-        );
+        assert!(!backend.unclaim_if_ownerless_and_empty(live, "bob").unwrap());
         assert_eq!(
             backend.get_session_agent_alias(live).unwrap(),
             Some("bob".to_string())
@@ -3488,11 +3484,10 @@ mod tests {
         // Another agent's owner must never be removed.
         let foreign = "foreign";
         backend.set_session_agent_alias(foreign, "mallory").unwrap();
-        assert_eq!(
-            backend
+        assert!(
+            !backend
                 .unclaim_if_ownerless_and_empty(foreign, "alice")
-                .unwrap(),
-            false
+                .unwrap()
         );
         assert_eq!(
             backend.get_session_agent_alias(foreign).unwrap(),

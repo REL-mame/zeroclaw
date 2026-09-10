@@ -1436,7 +1436,7 @@ impl RpcDispatcher {
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-// Reject noncanonical caller-supplied session ids before any backend
+        // Reject noncanonical caller-supplied session ids before any backend
         // keying or permit acquisition (see ensure_canonical_session_id).
         // Auto-generated UUIDs are always canonical, so this only affects
         // explicit ids.
@@ -1729,8 +1729,7 @@ impl RpcDispatcher {
             }
         }
 
-        self
-            .ctx
+        self.ctx
             .sessions
             .insert_if_absent(
                 session_id.clone(),
@@ -1738,7 +1737,7 @@ impl RpcDispatcher {
                     .with_owner(self.tui_id.clone()),
             )
             .await
-.map_err(|message| {
+            .map_err(|message| {
                 if message == "session already exists" {
                     rpc_err(SESSION_BUSY, "Session resume already in progress")
                 } else {
@@ -1827,11 +1826,7 @@ impl RpcDispatcher {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        let _ = self
-                            .ctx
-                            .sessions
-                            .remove(&session_id)
-                            .await;
+                        let _ = self.ctx.sessions.remove(&session_id).await;
                         return Err(rpc_err(
                             INTERNAL_ERROR,
                             "ACP session store is not available",
@@ -1908,22 +1903,14 @@ impl RpcDispatcher {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        let _ = self
-                            .ctx
-                            .sessions
-                            .remove(&session_id)
-                            .await;
+                        let _ = self.ctx.sessions.remove(&session_id).await;
                         return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
                     }
                     Ok(Err(e)) => {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        let _ = self
-                            .ctx
-                            .sessions
-                            .remove(&session_id)
-                            .await;
+                        let _ = self.ctx.sessions.remove(&session_id).await;
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1940,11 +1927,7 @@ impl RpcDispatcher {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        let _ = self
-                            .ctx
-                            .sessions
-                            .remove(&session_id)
-                            .await;
+                        let _ = self.ctx.sessions.remove(&session_id).await;
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
