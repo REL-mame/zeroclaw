@@ -11111,6 +11111,137 @@ mod tests {
         );
     }
 
+    /// An ownerless session that already carries transcript history must be
+    /// refused by the ordinary claim (`NeedsMigration`): adopting it here would
+    /// let the first claimant read another agent's history. The refusal must
+    /// name the operator path, and must not persist an owner on the way.
+    #[tokio::test]
+    async fn chat_session_new_refuses_ownerless_history_until_migrated() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "ownerless-history-001";
+        let key = format!("rpc_{sid}");
+        // History recorded with no owner: the shape a pre-upgrade deployment
+        // leaves behind.
+        chat_backend
+            .append(&key, &ChatMessage::user("pre-upgrade turn"))
+            .unwrap();
+
+        let err = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect_err("an ownerless non-empty session must not be adopted by a plain claim");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message
+                .contains("run `migrate session-ownership` to adopt"),
+            "the refusal must point at the migration path, got: {}",
+            err.message
+        );
+        assert_eq!(
+            chat_backend.get_session_agent_alias(&key).unwrap(),
+            None,
+            "a NeedsMigration refusal must not persist an owner"
+        );
+        assert_eq!(
+            sessions.get_generation(sid).await,
+            None,
+            "a NeedsMigration refusal must not install a live session"
+        );
+    }
+
+    /// The capacity pre-check runs *before* the ownership claim. With the live
+    /// store full and the target key durably owned by another agent, the
+    /// request must come back as `SESSION_LIMIT_REACHED`; if the claim ran
+    /// first it would surface the claim's `INVALID_PARAMS` conflict instead.
+    /// The two paths are distinguishable precisely because the owner is held
+    /// by someone else, so this pins the documented ordering rather than just
+    /// the rejection code.
+    #[tokio::test]
+    async fn chat_session_new_capacity_pre_check_precedes_ownership_claim() {
+        use zeroclaw_infra::session_backend::{ClaimOutcome, SessionBackend};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        // One slot, so a single live session fills the store.
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(1, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(Arc::clone(&chat_backend) as Arc<dyn SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+
+        let occupant = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+        sessions
+            .insert(
+                "occupant".to_string(),
+                crate::rpc::session::RpcSession::new(
+                    occupant,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let sid = "capacity-probe";
+        let key = format!("rpc_{sid}");
+        assert!(matches!(
+            chat_backend
+                .claim_session_agent_alias(&key, "other-agent")
+                .unwrap(),
+            ClaimOutcome::Claimed
+        ));
+
+        let err = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect_err("a full live store must be rejected before the claim runs");
+
+        assert_eq!(
+            err.code, SESSION_LIMIT_REACHED,
+            "capacity must be checked before the claim, got: {}",
+            err.message
+        );
+        assert_eq!(
+            chat_backend.get_session_agent_alias(&key).unwrap(),
+            Some("other-agent".to_string()),
+            "the rejected request must leave the durable owner untouched"
+        );
+    }
+
     /// A `session/new` for a non-empty session must be rejected when the
     /// backend returns `Unsupported` for `claim_session_agent_alias`,
     /// because without ownership tracking a caller-controlled session id
