@@ -46,7 +46,9 @@ const WS_CHANNEL_KEY: &str = "wss";
 struct ConnectParams {
     #[serde(rename = "type")]
     msg_type: String,
-    /// Client-chosen session ID for memory persistence
+    /// Echo of the session identity fixed at connection time (the
+    /// `session_id` query parameter, or the UUID the gateway minted). A frame
+    /// carrying a different id is rejected with `INVALID_SESSION_ID`.
     #[serde(default)]
     session_id: Option<String>,
     /// Device name for device registry tracking
@@ -280,20 +282,20 @@ struct WsStarted {
     stored_messages: Vec<zeroclaw_api::model_provider::ChatMessage>,
 }
 
-/// Starts a WS session once the identity is fixed: atomic ownership claim,
-/// history load, name resolution, then the `session_start` frame and the
-/// optional `connected` ack, in that order. Returns the transcript state the
-/// caller needs to restore. The claim runs before any history load so a
-/// caller-controlled id can never reassign an owner and read another agent's
-/// transcript (`gate_ws_session_claim` fails closed for cross-agent and
-/// ownerless-non-empty cases).
+/// Starts a WS session: atomic ownership claim, history load, name resolution,
+/// then the `session_start` greeting, in that order. Returns the transcript
+/// state the caller needs to restore. The claim runs before any history load
+/// so a caller-controlled id can never reassign an owner and read another
+/// agent's transcript (`gate_ws_session_claim` fails closed for cross-agent
+/// and ownerless-non-empty cases). The greeting is sent unconditionally here
+/// — before the first client frame is read — so a client never has to send
+/// anything to receive its session identity.
 async fn send_ws_session_start<S>(
     sender: &mut S,
     state: &crate::AppState,
     session_id: &str,
     agent_alias: &str,
     session_name: Option<&str>,
-    saw_connect: bool,
 ) -> Result<WsStarted, serde_json::Value>
 where
     S: SinkExt<Message> + Unpin,
@@ -333,13 +335,6 @@ where
     let _ = sender
         .send(Message::Text(session_start.to_string().into()))
         .await;
-    if saw_connect {
-        let ack = serde_json::json!({
-            "type": "connected",
-            "message": "Connection established"
-        });
-        let _ = sender.send(Message::Text(ack.to_string().into())).await;
-    }
     Ok(WsStarted {
         session_key,
         stored_messages,
@@ -518,13 +513,7 @@ async fn handle_socket(
 
     // When no backend is configured, fall back to the legacy
     // resolve-and-mint-UUID behaviour.
-    // Identity is fixed only after the optional first frame: a query id stays
-    // authoritative, but with none supplied the `connect` frame's id (or a
-    // minted UUID) decides — restoring the pre-existing no-query + frame-id
-    // client shape. Ownership claim, history load and `session_start` all run
-    // once identity is set, immediately after the frame loop.
     let config = state.config.read().clone();
-    let mut pending_identity = requested_session_id.clone();
     let mut saw_connect = false;
     let ws_memory = match resolve_ws_memory_handle(&config, &agent_alias).await {
         Ok(memory) => memory,
@@ -547,32 +536,28 @@ async fn handle_socket(
     let mut requested_cwd = session_cwd;
     let mut ping_interval = websocket_ping_interval(&config);
 
-    // Single-identity contract. A query-supplied id fixes the session before
-    // the first frame: ownership claim, history load and `session_start` all
-    // run immediately. With no query id the `connect` frame's id (or a minted
-    // UUID) decides, so the identity-resolving frame loop below runs first and
-    // `session_start` follows — restoring the no-query + frame-id client shape.
-    let query_supplied_id = requested_session_id.is_some();
-    let mut started: Option<WsStarted> = None;
-    if query_supplied_id {
-        let sid = pending_identity.as_deref().unwrap_or_default();
-        started = match send_ws_session_start(
-            &mut sender,
-            &state,
-            sid,
-            &agent_alias,
-            session_name.as_deref(),
-            false,
-        )
-        .await
-        {
-            Ok(hs) => Some(hs),
-            Err(frame) => {
-                let _ = sender.send(Message::Text(frame.to_string().into())).await;
-                return;
-            }
-        };
-    }
+    // Single-identity contract: the session is fixed before the first frame is
+    // read. A query-supplied id is authoritative; otherwise the gateway mints
+    // a UUID. Ownership claim, history load and the `session_start` greeting
+    // all run right here, so the client gets its identity without sending
+    // anything — and the `connect` frame below can only echo it, never switch
+    // the session scope.
+    let session_id = requested_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let hs = match send_ws_session_start(
+        &mut sender,
+        &state,
+        &session_id,
+        &agent_alias,
+        session_name.as_deref(),
+    )
+    .await
+    {
+        Ok(hs) => hs,
+        Err(frame) => {
+            let _ = sender.send(Message::Text(frame.to_string().into())).await;
+            return;
+        }
+    };
 
     loop {
         let first = tokio::select! {
@@ -583,7 +568,6 @@ async fn handle_socket(
                 }
                 continue;
             }
-            _ = tokio::time::sleep(Duration::from_secs(30)), if !query_supplied_id => break,
         };
 
         match first {
@@ -618,33 +602,22 @@ async fn handle_socket(
                                 let _ = sender.send(Message::Text(err.to_string().into())).await;
                                 return;
                             }
-                            // A query-supplied id is authoritative: the connect frame may only
-                            // echo it, never switch to a different (canonical but
-                            // unclaimed) id — otherwise the transcript key and
-                            // the memory scope would diverge and the frame could
-                            // read/write another same-agent session bucket. With
-                            // no query id, the frame itself fixes the identity
-                            // (restored legacy client shape) and is claimed
-                            // right after the loop.
-                            match &pending_identity {
-                                Some(query_id) => {
-                                    if zeroclaw_api::session_keys::canonical_memory_id(sid)
-                                        != zeroclaw_api::session_keys::canonical_memory_id(query_id)
-                                    {
-                                        let err = serde_json::json!({
-                                            "type": "error",
-                                            "code": "INVALID_SESSION_ID",
-                                            "message": "connect.session_id must match the session claimed in the handshake"
-                                        });
-                                        let _ = sender
-                                            .send(Message::Text(err.to_string().into()))
-                                            .await;
-                                        return;
-                                    }
-                                }
-                                None => {
-                                    pending_identity = Some(sid.clone());
-                                }
+                            // The handshake already fixed the session: this frame may
+                            // only echo that id, never switch to a different
+                            // (canonical but unclaimed) one — otherwise the
+                            // transcript key and the memory scope would diverge
+                            // and the frame could read/write another same-agent
+                            // session bucket.
+                            if zeroclaw_api::session_keys::canonical_memory_id(sid)
+                                != zeroclaw_api::session_keys::canonical_memory_id(&session_id)
+                            {
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "code": "INVALID_SESSION_ID",
+                                    "message": "connect.session_id must match the session claimed in the handshake"
+                                });
+                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                return;
                             }
                             ::zeroclaw_log::record!(
                                 DEBUG,
@@ -659,8 +632,8 @@ async fn handle_socket(
                         if cp.cwd.is_some() {
                             requested_cwd = cp.cwd;
                         }
-                        // The `connected` ack is deferred until after
-                        // `session_start` is sent, once identity is finalized.
+                        // The `connected` ack follows the `session_start`
+                        // greeting once the frame loop finishes.
                         saw_connect = true;
                     } else {
                         // Not a connect message — fall through to normal processing
@@ -683,34 +656,8 @@ async fn handle_socket(
         }
     }
 
-    // Finalize the identity (no-query paths mint a UUID) and start the session.
-    // Ownership claim + history load + `session_start` all run now that the
-    // identity is fixed; a query-id connection already ran them ahead of the
-    // first frame, so only the `connected` ack (from a connect first frame) is
-    // still pending there.
-    let session_id = pending_identity
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let hs = match started {
-        Some(hs) => hs,
-        None => match send_ws_session_start(
-            &mut sender,
-            &state,
-            &session_id,
-            &agent_alias,
-            session_name.as_deref(),
-            saw_connect,
-        )
-        .await
-        {
-            Ok(hs) => hs,
-            Err(frame) => {
-                let _ = sender.send(Message::Text(frame.to_string().into())).await;
-                return;
-            }
-        },
-    };
-    if saw_connect && query_supplied_id {
+    // The `connect` frame's ack trails the greeting it echoed.
+    if saw_connect {
         let ack = serde_json::json!({
             "type": "connected",
             "message": "Connection established"
@@ -2001,15 +1948,12 @@ data: {\"type\":\"message_stop\"}\n\n",
         let (mut client, _) = connect_async(format!("ws://{gateway_addr}/ws/chat?agent=web"))
             .await
             .expect("WebSocket upgrade");
-        // No query session id, so identity is fixed by the first frame: the
-        // `connect` frame must be sent before `session_start` is delivered.
-        client
-            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+        // The greeting is pushed as soon as the connection is up — with no
+        // query session id the gateway mints one — so the client can read it
+        // before sending anything.
+        let first = tokio::time::timeout(Duration::from_secs(1), client.next())
             .await
-            .expect("connect frame");
-        let first = client
-            .next()
-            .await
+            .expect("session_start timeout")
             .expect("session_start frame")
             .expect("session_start");
         assert!(
@@ -2018,9 +1962,14 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .expect("text session_start")
                 .contains("session_start")
         );
-        let connected = client
-            .next()
+        // Only then does the `connect` frame get acknowledged.
+        client
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
             .await
+            .expect("connect frame");
+        let connected = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("connected timeout")
             .expect("connected frame")
             .expect("connected");
         assert!(
@@ -2171,11 +2120,13 @@ data: {\"type\":\"message_stop\"}\n\n",
         server.abort();
     }
 
-    /// When the URL supplies no session id, a `connect` frame carrying an id
-    /// fixes the connection's identity (restored legacy client shape): the
-    /// `session_start` must echo the frame's id and the backend must claim it.
+    /// A client that supplies no query id must still receive its greeting
+    /// without sending a single frame: the gateway mints the identity and
+    /// pushes `session_start` as soon as the connection is up. The greeting
+    /// cannot be deferred to a later frame, and a `connect` frame arriving
+    /// afterwards can only echo the minted id — never switch the session.
     #[tokio::test]
-    async fn connect_frame_id_sets_session_when_query_has_no_id() {
+    async fn no_query_client_receives_greeting_before_sending_any_frame() {
         use zeroclaw_config::multi_agent::MemoryBackendKind;
         use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
@@ -2208,12 +2159,31 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .expect("test gateway server");
         });
 
-        // No `session_id` in the query — the connect frame must fix identity.
+        // No `session_id` in the query and, crucially, no frame sent by the
+        // client: the greeting must arrive on its own.
         let scheme = "ws";
         let (mut socket, _) = connect_async(format!("{scheme}://{address}/ws/chat?agent=web"))
             .await
             .expect("chat WebSocket upgrade");
 
+        let greeting = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("session_start must not wait for a client frame")
+            .expect("session_start frame")
+            .expect("session_start transport");
+        let json: serde_json::Value =
+            serde_json::from_str(&greeting.into_text().expect("text frame")).expect("JSON frame");
+        assert_eq!(
+            json["type"], "session_start",
+            "the first server frame must be the greeting"
+        );
+        assert!(
+            json["session_id"].as_str().is_some_and(|id| !id.is_empty()),
+            "the gateway must mint a non-empty session id"
+        );
+
+        // A `connect` frame may only echo the minted identity. This one asks
+        // for a different session and must be rejected.
         socket
             .send(ClientMessage::Text(
                 serde_json::json!({"type": "connect", "session_id": "frame-scoped"})
@@ -2221,37 +2191,20 @@ data: {\"type\":\"message_stop\"}\n\n",
                     .into(),
             ))
             .await
-            .expect("send connect frame with id");
+            .expect("send divergent connect frame");
 
-        let mut saw_start = false;
-        let mut saw_connected = false;
-        for _ in 0..4 {
-            let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
-                .await
-                .expect("frame timeout")
-                .expect("gateway frame")
-                .expect("gateway transport");
-            let json: serde_json::Value =
-                serde_json::from_str(&frame.into_text().expect("text frame")).expect("JSON frame");
-            match json["type"].as_str() {
-                Some("session_start") => {
-                    assert_eq!(
-                        json["session_id"], "frame-scoped",
-                        "the no-query connect id must drive the session identity"
-                    );
-                    saw_start = true;
-                }
-                Some("connected") => saw_connected = true,
-                _ => {}
-            }
-            if saw_start && saw_connected {
-                break;
-            }
-        }
-        assert!(saw_start, "session_start frame must arrive");
-        assert!(
-            saw_connected,
-            "connected ack must arrive after session_start"
+        let rejection = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("rejection timeout")
+            .expect("gateway frame")
+            .expect("gateway transport");
+        let json: serde_json::Value =
+            serde_json::from_str(&rejection.into_text().expect("text frame")).expect("JSON frame");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["code"], "INVALID_SESSION_ID");
+        assert_eq!(
+            json["message"],
+            "connect.session_id must match the session claimed in the handshake"
         );
 
         server.abort();

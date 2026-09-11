@@ -14,6 +14,8 @@ pub struct SessionActorQueue {
     max_queue_depth: usize,
     lock_timeout: Duration,
     idle_ttl: Duration,
+    #[cfg(test)]
+    registration_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct SessionSlot {
@@ -114,7 +116,28 @@ impl SessionActorQueue {
             max_queue_depth,
             lock_timeout: Duration::from_secs(lock_timeout_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
+            #[cfg(test)]
+            registration_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Test-only hook invoked while `acquire` holds the slot-map lock, just
+    /// before the pending count is incremented. Lets a test pin the
+    /// registration/eviction interleaving instead of racing it on a timer.
+    #[cfg(test)]
+    fn run_registration_hook(&self) {
+        let hook = match self.registration_hook.lock() {
+            Ok(hook) => hook,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(hook) = hook.as_ref() {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_registration_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.registration_hook.lock().unwrap() = Some(hook);
     }
 
     /// Acquire exclusive access to a session. Cancel-safe: `PendingGuard`
@@ -135,6 +158,10 @@ impl SessionActorQueue {
                     })
                 })
                 .clone();
+            // Register while still holding the map lock, so `evict_idle`
+            // cannot remove this slot before it observes the pending request.
+            #[cfg(test)]
+            self.run_registration_hook();
             let current = s.pending.fetch_add(1, Ordering::Relaxed);
             (s, current)
         };
@@ -261,6 +288,50 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         let evicted = queue.evict_idle().await;
         assert_eq!(evicted, 1);
+    }
+
+    /// Registration and idle eviction must not interleave. The hook parks
+    /// `acquire` inside the slot-map critical section (pending not yet
+    /// incremented); an `evict_idle` arriving there must block on the map lock
+    /// rather than observe a slot with no pending request and evict it while
+    /// the caller is about to use it. Barriers make the interleaving exact —
+    /// no wall-clock guesswork.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_and_eviction_are_atomic() {
+        let queue = Arc::new(SessionActorQueue::new(8, 5, 0));
+        let selected = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let hook_selected = selected.clone();
+        let hook_resume = resume.clone();
+        queue.set_registration_hook(Arc::new(move || {
+            hook_selected.wait();
+            hook_resume.wait();
+        }));
+
+        let acquire_queue = queue.clone();
+        let acquire = zeroclaw_spawn::spawn!(async move { acquire_queue.acquire("s1").await });
+        tokio::task::spawn_blocking(move || selected.wait())
+            .await
+            .unwrap();
+
+        let evict_queue = queue.clone();
+        let mut eviction = zeroclaw_spawn::spawn!(async move { evict_queue.evict_idle().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut eviction)
+                .await
+                .is_err(),
+            "eviction must wait for request registration to release the slot map"
+        );
+        tokio::task::spawn_blocking(move || resume.wait())
+            .await
+            .unwrap();
+
+        let guard = acquire.await.unwrap().unwrap();
+        assert_eq!(eviction.await.unwrap(), 0);
+        assert_eq!(queue.queue_depth("s1").await, 1);
+
+        drop(guard);
+        assert_eq!(queue.evict_idle().await, 1);
     }
 
     /// While a `SessionGuard` is alive, the slot must remain in the map
