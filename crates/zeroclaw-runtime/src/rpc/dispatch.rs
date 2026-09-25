@@ -20198,6 +20198,15 @@ mod tests {
         chat_backend
             .replace_conversation_state(&session_key, &over_cap, false)
             .unwrap();
+        {
+            use zeroclaw_infra::session_backend::{AdoptOutcome, SessionBackend};
+            assert!(matches!(
+                chat_backend
+                    .adopt_session_agent_alias(&session_key, "test-agent")
+                    .unwrap(),
+                AdoptOutcome::Adopted
+            ));
+        }
 
         dispatcher
             .handle_session_new_for_test(&json!({
@@ -20707,6 +20716,15 @@ mod tests {
                 &ChatMessage::assistant("Chat history"),
             )
             .unwrap();
+        {
+            use zeroclaw_infra::session_backend::{AdoptOutcome, SessionBackend};
+            assert!(matches!(
+                chat_backend
+                    .adopt_session_agent_alias(&format!("rpc_{sid}"), "test-agent")
+                    .unwrap(),
+                AdoptOutcome::Adopted
+            ));
+        }
         let mut previous = None;
         for (mode, expected_history) in [
             ("chat", "Chat history"),
