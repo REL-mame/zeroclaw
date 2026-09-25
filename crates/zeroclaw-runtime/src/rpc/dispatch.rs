@@ -22547,7 +22547,8 @@ mod tests {
             None,
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
 
         let occupant = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
@@ -22655,7 +22656,8 @@ mod tests {
             None,
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
 
         let result = dispatcher
             .handle_session_new_for_test(&json!({
@@ -22733,7 +22735,8 @@ mod tests {
             None,
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
 
         let result = dispatcher
             .handle_session_new_for_test(&json!({
