@@ -2955,8 +2955,9 @@ data: {\"type\":\"message_stop\"}\n\n",
             },
         );
 
-        let backend: Arc<dyn SessionBackend> =
-            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
         let session_id = "restore-trim-session";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
         let over_cap = vec![
@@ -2970,6 +2971,18 @@ data: {\"type\":\"message_stop\"}\n\n",
         backend
             .replace_conversation_state(&session_key, &over_cap, false)
             .unwrap();
+        // Settlement of an ownerless but non-empty session (e.g. data written
+        // before ownership tracking existed) happens via the trusted migration
+        // CLI (`migrate session-ownership`). Reproduce that here so the
+        // connection's claim sees an owned session instead of a
+        // `NeedsMigration` refusal, letting the restore-time-trim behaviour
+        // under test be exercised.
+        assert_eq!(
+            backend
+                .adopt_session_agent_alias(&session_key, "web")
+                .unwrap(),
+            zeroclaw_infra::session_backend::AdoptOutcome::Adopted,
+        );
 
         let mut state = crate::api::tests::test_state(config);
         state.session_backend = Some(backend.clone());
@@ -5862,7 +5875,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             "model_context_window is additive and omitted when unset"
         );
     }
-#[test]
+    #[test]
     fn gate_mints_uuid_when_no_explicit_session_id() {
         let backend = FakeBackend::new();
         gate_ws_session_claim(None, "default", &backend)

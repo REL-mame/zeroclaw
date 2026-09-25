@@ -3478,6 +3478,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn claim_ownership_first_caller_wins_then_conflict() {
         use crate::session_backend::ClaimOutcome;
         let tmp = TempDir::new().unwrap();

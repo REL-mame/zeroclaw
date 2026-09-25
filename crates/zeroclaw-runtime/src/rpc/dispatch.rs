@@ -3222,7 +3222,6 @@ impl RpcDispatcher {
             ensure_canonical_session_id(&session_id)?;
         }
 
-        let config = self.ctx.config.read().clone();
         let chat_mode = req
             .chat_mode
             .clone()
