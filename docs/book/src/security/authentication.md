@@ -540,19 +540,22 @@ session they were raised for. Sessions created before this change (or by
 unscoped connections) carry no owner: they stay fully visible to unscoped
 connections and invisible to scoped principals.
 
-A separate, per-session axis records the **owning agent alias**, and it is
-claimed atomically before any transcript is read. A caller-supplied session id
-can therefore never reassign ownership and then read another agent's history:
+A separate, per-session axis records the **owning agent alias**. Persistent RPC
+Chat and gateway WebSocket admission claim it atomically before transcript
+restoration or live session publication.
+On these paths, a caller-supplied session id cannot reassign ownership and then
+read another agent's history:
 the claim refuses a session owned by a different alias, and it refuses an
 unowned session that already has history rather than silently adopting it.
 Those ownerless histories are adopted deliberately, with an explicit target
 agent, by `zeroclaw migrate session-ownership`. Session ids are also required
-to be canonical before they reach storage, so a display id can never collapse
-onto another session's key. A backend that cannot enforce the claim (raw JSONL)
-is refused for every caller, empty and non-empty sessions alike, rather than
-admitting a session whose owner cannot outlive the process. With the configured
-SQLite default, the factory imports legacy JSONL history on construction, so
-those deployments migrate rather than lose access.
+to be canonical before chat ownership admission or transcript restoration, so
+a display id can never collapse onto another session's key. A backend that
+cannot enforce the claim (raw JSONL)
+is refused for every caller on these paths, empty and non-empty sessions alike,
+rather than admitting a session whose owner cannot outlive the process. With
+the configured SQLite default, the factory imports legacy JSONL history on
+construction and preserves it for explicit ownership migration.
 
 ## Migrating from [security.nevis]
 
