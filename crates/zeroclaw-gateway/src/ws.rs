@@ -307,7 +307,28 @@ where
     let mut effective_name: Option<String> = None;
     if let Some(ref backend) = state.session_backend {
         gate_ws_session_claim(Some(session_id), agent_alias, backend.as_ref())?;
-        let messages = backend.load(&session_key);
+        // An unreadable transcript must not become an empty session that a
+        // later turn persists over the existing history.
+        let messages = match backend.try_load(&session_key) {
+            Ok(messages) => messages,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "error": format!("{}", e),
+                        })),
+                    "Failed to load WS session transcript; refusing to open with unverified history"
+                );
+                return Err(serde_json::json!({
+                    "type": "error",
+                    "message": "session restore unavailable; retry the connection",
+                    "code": "SESSION_RESTORE_UNAVAILABLE"
+                }));
+            }
+        };
         if !messages.is_empty() {
             message_count = messages.len();
             stored_messages = messages;
@@ -3847,6 +3868,104 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         .expect("first chat response timeout");
 
         assert_eq!(response["code"], "NEEDS_ONBOARDING");
+        server.abort();
+    }
+
+    /// A claimed session with unreadable history must emit an error before
+    /// any greeting. The legacy `load` fallback would silently erase it.
+    #[tokio::test]
+    async fn unreadable_claimed_session_refuses_before_greeting() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+        use zeroclaw_infra::session_backend::{ClaimOutcome, SessionBackend};
+        use zeroclaw_providers::ChatMessage;
+
+        struct UnreadableBackend {
+            claims: AtomicUsize,
+            reads: AtomicUsize,
+        }
+
+        impl SessionBackend for UnreadableBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                panic!("the handshake must not fall back to infallible load")
+            }
+            fn try_load(&self, _key: &str) -> std::io::Result<Vec<ChatMessage>> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unreadable test transcript",
+                ))
+            }
+            fn append(&self, _key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn claim_session_agent_alias(
+                &self,
+                _key: &str,
+                _alias: &str,
+            ) -> std::io::Result<ClaimOutcome> {
+                self.claims.fetch_add(1, Ordering::SeqCst);
+                Ok(ClaimOutcome::Claimed)
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().expect("temporary config root");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("test data directory");
+        let mut agent = AliasedAgentConfig::default();
+        agent.memory.backend = MemoryBackendKind::None;
+        config.agents.insert("web".to_string(), agent);
+
+        let backend = Arc::new(UnreadableBackend {
+            claims: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
+        });
+        let mut state = crate::api::tests::test_state(config);
+        state.session_backend = Some(Arc::clone(&backend) as Arc<dyn SessionBackend>);
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test gateway server");
+        });
+
+        let scheme = "ws";
+        let (mut socket, _) = connect_async(format!(
+            "{scheme}://{address}/ws/chat?agent=web&session_id=unreadable"
+        ))
+        .await
+        .expect("chat WebSocket upgrade");
+        let frame = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("refusal timeout")
+            .expect("refusal frame")
+            .expect("refusal transport");
+        let json: serde_json::Value =
+            serde_json::from_str(&frame.into_text().expect("text frame")).expect("JSON frame");
+        assert_eq!(
+            json["type"], "error",
+            "no session_start may precede refusal"
+        );
+        assert_eq!(json["code"], "SESSION_RESTORE_UNAVAILABLE");
+        assert_eq!(backend.claims.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.reads.load(Ordering::SeqCst), 1);
         server.abort();
     }
 

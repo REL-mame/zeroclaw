@@ -4027,10 +4027,10 @@ impl RpcDispatcher {
                 crate::rpc::types::ChatMode::Chat => {
                     if let Some(ref backend) = self.ctx.session_backend {
                         let session_key = format!("rpc_{session_id}");
-                        // Atomic ownership admission BEFORE any read or publish:
-                        // a caller-controlled session id can never reassign the
-                        // owner of an existing session and then read another
-                        // agent's transcript. Ordinary claim rejects cross-agent
+                        // Atomic ownership admission before transcript restore
+                        // or live publication: a caller-controlled session id
+                        // cannot reassign the owner of another agent's history.
+                        // Ordinary claim rejects cross-agent
                         // conflict and ownerless-nonempty (unmigrated) sessions;
                         // backends without ownership tracking fail closed
                         // uniformly across WS / HTTP / RPC, even for empty
@@ -4053,24 +4053,12 @@ impl RpcDispatcher {
                                 ));
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                                // A backend that cannot enforce ownership claims
-                                // admits no session that must survive under an
-                                // isolation boundary. For a scoped creator the
-                                // owner stamp is that boundary, so the failure is
-                                // an INTERNAL_ERROR "not created" (aligned with
-                                // `set_session_principal`, where a scoped creator
-                                // facing an unstampable backend fails closed and
-                                // unwinds the live entry). An unscoped creator
-                                // only loses attribution — there is no isolation
-                                // to preserve — so admission proceeds and the
-                                // later `set_session_principal` report (if any)
-                                // is attribution-only.
-                                if self.scoped_principal_id().is_some() {
-                                    return Err(rpc_err(
-                                        INTERNAL_ERROR,
-                                        "The session was not created: backend does not track agent ownership",
-                                    ));
-                                }
+                                // Without a durable agent owner, even an empty
+                                // identity could later resume under another agent.
+                                return Err(rpc_err(
+                                    INTERNAL_ERROR,
+                                    "The session was not created: backend does not track agent ownership",
+                                ));
                             }
                             Err(e) => {
                                 return Err(rpc_err(
@@ -16764,12 +16752,10 @@ mod tests {
         }
     }
 
-    /// For a scoped creator the owner stamp is the isolation boundary: a
-    /// backend that cannot record it fails the creation and leaves no live
-    /// entry, instead of a session that reappears ownerless after a restart.
-    /// An unscoped creator's stamp is attribution only, so creation proceeds.
+    /// A backend without ownership claims cannot create a Chat session for
+    /// either a scoped creator or the shared operator.
     #[tokio::test]
-    async fn scoped_creation_fails_closed_when_the_owner_cannot_be_recorded() {
+    async fn unsupported_claim_fails_closed_for_scoped_and_operator_creators() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = two_user_config(&tmp);
         use zeroclaw_infra::session_queue::SessionActorQueue;
@@ -16799,13 +16785,15 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut operator = RpcDispatcher::new(Arc::clone(&ctx), tx, "test-peer".into());
         operator.set_authenticated_for_test();
-        operator
+        let err = operator
             .handle_session_new_for_test(
                 &json!({"agent_alias": "test-agent", "session_id": "operator-ok"}),
             )
             .await
-            .expect("an unscoped creator is not blocked by a missing attribution stamp");
-        assert!(sessions.get_agent("operator-ok").await.is_some());
+            .expect_err("an operator also needs a durable agent owner");
+        assert_eq!(err.code, INTERNAL_ERROR, "{}", err.message);
+        assert!(err.message.contains("not created"), "{}", err.message);
+        assert!(sessions.get_agent("operator-ok").await.is_none());
     }
 
     /// The ownership boundary through the real request path: the coarse gate
@@ -24190,14 +24178,10 @@ mod tests {
         );
     }
 
-    /// A `session/new` for a non-empty session is allowed for an unscoped
-    /// caller even when the backend returns `Unsupported` for
-    /// `claim_session_agent_alias`. Ownership enforcement only fails closed
-    /// for a scoped creator (where the owner stamp is the isolation
-    /// boundary); an unscoped creator loses only attribution, so admission
-    /// proceeds — matching `set_session_principal`.
+    /// A non-empty session cannot be restored when the backend cannot
+    /// durably claim its agent owner, even for an unscoped creator.
     #[tokio::test]
-    async fn rpc_allows_unscoped_nonempty_session_when_claim_unsupported() {
+    async fn rpc_refuses_unscoped_nonempty_session_when_claim_unsupported() {
         use std::sync::Arc;
         use zeroclaw_infra::session_backend::{ClaimOutcome, SessionBackend};
         use zeroclaw_infra::session_queue::SessionActorQueue;
@@ -24256,18 +24240,19 @@ mod tests {
             }))
             .await;
 
-        result
-            .expect("an unscoped creator may create a non-empty session even when the backend does not track ownership");
+        let err = result.expect_err("an unsupported owner claim must refuse restored history");
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(
+            err.message
+                .contains("backend does not track agent ownership")
+        );
+        assert!(sessions.get_agent("test-session").await.is_none());
     }
 
-    /// A `session/new` for an empty session is allowed for an unscoped caller
-    /// even when the backend returns `Unsupported` for
-    /// `claim_session_agent_alias`. Ownership enforcement fails closed only
-    /// for a scoped creator (isolated proprietor); an unscoped creator has no
-    /// isolation to preserve, so admission proceeds just as for the
-    /// non-empty case above.
+    /// An empty session cannot acquire an ownerless identity that might later
+    /// be resumed under a different agent.
     #[tokio::test]
-    async fn rpc_allows_unscoped_session_when_claim_unsupported() {
+    async fn rpc_refuses_unscoped_empty_session_when_claim_unsupported() {
         use std::sync::Arc;
         use zeroclaw_infra::session_backend::{ClaimOutcome, SessionBackend};
         use zeroclaw_infra::session_queue::SessionActorQueue;
@@ -24326,8 +24311,13 @@ mod tests {
             }))
             .await;
 
-        result
-            .expect("an unscoped creator may create an empty session even when the backend does not track ownership");
+        let err = result.expect_err("an unsupported owner claim must refuse a new identity");
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(
+            err.message
+                .contains("backend does not track agent ownership")
+        );
+        assert!(sessions.get_agent("test-session").await.is_none());
     }
 
     /// Noncanonical caller-supplied session ids must be rejected before any
