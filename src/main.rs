@@ -6295,6 +6295,20 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
+        service_command: ServiceCommands::RunWindowsDaemon,
+        ..
+    } = &cli.command
+    {
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("Windows task runner requires --config-dir")?;
+        return service::run_windows_daemon(config_dir).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
         service_command: ServiceCommands::RunDesktopDaemon { port },
         ..
     } = &cli.command
@@ -6762,6 +6776,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     rotate_device,
                     port,
                     host,
+                    json,
                 }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     let endpoint = format!("{host}:{port}");
@@ -6777,14 +6792,26 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     };
                     let rotating = action.is_rotation();
 
-                    match fetch_paircode(
+                    let fetched = fetch_paircode(
                         &host,
                         port,
                         config.gateway.path_prefix.as_deref(),
+                        &config.data_dir,
                         &action,
                     )
-                    .await
-                    {
+                    .await;
+                    if json {
+                        let (code, message) = match fetched? {
+                            PaircodeResult::Code { code, message } => (Some(code), message),
+                            PaircodeResult::NoCode { message } => (None, message),
+                        };
+                        println!(
+                            "{}",
+                            serde_json::json!({ "pairing_code": code, "message": message })
+                        );
+                        return Ok(());
+                    }
+                    match fetched {
                         Ok(PaircodeResult::Code { code, message }) => {
                             println!(
                                 "{}",
@@ -8573,6 +8600,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                     }
                     _ => None,
                 };
+
+                // With no daemon, this command owns the live-pricing refresher,
+                // as the daemon does when it runs the channels.
+                zeroclaw_runtime::daemon::spawn_pricing_refresher(&config);
 
                 let result = Box::pin(channels::start_channels(
                     config,
@@ -10707,8 +10738,19 @@ async fn fetch_paircode(
     host: &str,
     port: u16,
     path_prefix: Option<&str>,
+    data_dir: &std::path::Path,
     action: &PaircodeAction,
 ) -> Result<PaircodeResult> {
+    // The pairing-code admin routes accept only this run's admin token, which
+    // the gateway writes owner-only into its data directory at startup.
+    let admin_token =
+        zeroclaw_config::pairing::read_gateway_admin_token(data_dir).ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "No gateway admin token at {}. Run this on the gateway host, as the user that \
+             runs the gateway, while the gateway is running.",
+                zeroclaw_config::pairing::gateway_admin_token_path(data_dir).display()
+            ))
+        })?;
     let client = reqwest::Client::new();
 
     let response = if action.mints_code() {
@@ -10719,6 +10761,10 @@ async fn fetch_paircode(
         }
         client
             .post(&url)
+            .header(
+                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                &admin_token,
+            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -10726,6 +10772,10 @@ async fn fetch_paircode(
         let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
+            .header(
+                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                &admin_token,
+            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -10755,6 +10805,12 @@ async fn fetch_paircode(
         );
         anyhow::Error::msg(format!("Gateway responded with status {status}: {e}"))
     })?;
+
+    if status == reqwest::StatusCode::FORBIDDEN
+        && let Some(error) = json.get("error").and_then(|v| v.as_str())
+    {
+        anyhow::bail!("{error}");
+    }
 
     let message = json
         .get("message")
@@ -12473,7 +12529,7 @@ async fn run_gateway_if_enabled(
     host: &str,
     port: u16,
     config: zeroclaw::config::Config,
-    tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    event_bus: Option<zeroclaw_runtime::observability::EventBus>,
 ) -> anyhow::Result<()> {
     let default_host = config.gateway.host.clone();
     let default_port = config.gateway.port;
@@ -12481,12 +12537,23 @@ async fn run_gateway_if_enabled(
     // can self-respawn after the listener is released. Must mirror the same
     // call in the Daemon branch.
     zeroclaw_runtime::restart::record_launch();
+    // With no daemon, this command owns what the daemon would: the
+    // live-pricing refresher and the gateway-start hook, which fires once
+    // the listener reports its bound address.
+    zeroclaw_runtime::daemon::spawn_pricing_refresher(&config);
+    let hooks = config.hooks.enabled.then(|| {
+        std::sync::Arc::new(zeroclaw_runtime::hooks::HookRunner::from_config(
+            &config.hooks,
+        ))
+    });
+    let readiness =
+        zeroclaw_runtime::daemon::gateway_start_hook_reporter(hooks, host.to_string(), None);
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None, None, None,
+        host, port, config, event_bus, None, None, None, None, None, None, None, readiness,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -12511,7 +12578,7 @@ async fn run_gateway_if_enabled(
     _host: &str,
     _port: u16,
     _config: zeroclaw::config::Config,
-    _tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    _event_bus: Option<zeroclaw_runtime::observability::EventBus>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
 }
@@ -14246,6 +14313,36 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn windows_daemon_cli_requires_config_dir_and_stays_hidden() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "--config-dir",
+            "C:\\Users\\agent\\Zero Claw",
+            "service",
+            "run-windows-daemon",
+        ])
+        .expect("internal Windows task runner should parse");
+        assert_eq!(
+            cli.config_dir.as_deref(),
+            Some("C:\\Users\\agent\\Zero Claw")
+        );
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunWindowsDaemon,
+                ..
+            }
+        ));
+        assert!(
+            !Cli::command()
+                .render_help()
+                .to_string()
+                .contains("run-windows-daemon")
+        );
+    }
+
+    #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
         fn argv(parts: &[&str]) -> std::vec::IntoIter<std::ffi::OsString> {
             parts
@@ -14672,6 +14769,7 @@ mod tests {
                         rotate_device,
                         port,
                         host,
+                        json,
                     }),
             } => {
                 assert!(new);
@@ -14679,6 +14777,7 @@ mod tests {
                 assert_eq!(rotate_device, None);
                 assert_eq!(port, Some(3001));
                 assert_eq!(host.as_deref(), Some("192.168.1.20"));
+                assert!(!json, "text output is the default");
             }
             other => panic!("expected gateway get-paircode command, got {other:?}"),
         }
