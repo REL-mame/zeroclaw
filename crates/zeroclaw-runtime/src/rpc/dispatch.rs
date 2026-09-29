@@ -27267,6 +27267,7 @@ mod tests {
     async fn session_messages_rechecks_queued_chat_owner_before_reaped_acp_read() {
         use serde_json::from_value;
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        use zeroclaw_infra::session_backend::AdoptOutcome;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -27320,12 +27321,22 @@ mod tests {
         // Keep the reader's initial owner lookup unambiguous. The queued
         // Chat replacement then installs the second durable domain before
         // either operation is admitted, exercising the post-wait recheck.
+        let chat_key = format!("rpc_{sid}");
         chat_backend
-            .append(
-                &format!("rpc_{sid}"),
-                &ChatMessage::assistant("queued Chat history"),
-            )
+            .append(&chat_key, &ChatMessage::assistant("queued Chat history"))
             .unwrap();
+        // Record the durable owner for this pre-existing history the way the
+        // trusted `migrate session-ownership` CLI does. Ordinary claim refuses
+        // to adopt an ownerless session that already carries history
+        // (`ClaimOutcome::NeedsMigration`), so without the adoption the queued
+        // Chat `session/new` below is rejected before it can install the
+        // second durable domain this test asserts on.
+        assert!(matches!(
+            chat_backend
+                .adopt_session_agent_alias(&chat_key, "test-agent")
+                .unwrap(),
+            AdoptOutcome::Adopted
+        ));
         drop(queue_guard);
         chat_task.await.unwrap().expect("queued Chat session/new");
         let result = messages_task
