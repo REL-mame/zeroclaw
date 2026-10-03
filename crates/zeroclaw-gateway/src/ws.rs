@@ -489,13 +489,17 @@ where
         };
         match resolved {
             Some(Ok(outcome)) => {
-                let config = state.config.read();
-                zeroclaw_runtime::sop::drive_resumed_broker_action(
+                let config = state.config.read().clone();
+                zeroclaw_runtime::sop::drive_resumed_broker_action_with_capability(
                     &config,
                     std::sync::Arc::clone(engine),
                     state.sop_audit.clone(),
                     state.sop_driver_handles.as_ref(),
                     &outcome,
+                    Some(zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                        std::sync::Arc::clone(&state.config),
+                        state.agent_lifecycle.clone(),
+                    )),
                 );
                 serde_json::json!({
                     "type": "sop_approval_result",
@@ -726,6 +730,25 @@ async fn handle_socket(
     let stored_messages = hs.stored_messages;
     let memory_session_id = zeroclaw_api::session_keys::canonical_memory_id(&session_id);
 
+    // Reserve this alias generation for construction so a concurrent delete
+    // cannot tear the agent down mid-build. `turn_generation` is what the
+    // connection keeps afterwards; the reservation is released once the build
+    // finishes below.
+    let construction_reservation =
+        match state.agent_lifecycle.reserve_admission(agent_alias.clone()) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": error.to_string(),
+                    "code": "AGENT_LIFECYCLE_UNAVAILABLE"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                return;
+            }
+        };
+    let turn_generation = state.agent_lifecycle.alias_generation(&agent_alias);
+
     let session_cwd = match resolve_ws_session_cwd(requested_cwd.as_deref(), &config, &agent_alias)
     {
         Ok(cwd) => cwd,
@@ -745,8 +768,12 @@ async fn handle_socket(
         return;
     }
 
+    let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
+        Arc::clone(&state.config),
+        state.agent_lifecycle.clone(),
+    );
     let mut agent =
-        match zeroclaw_runtime::agent::Agent::from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
+        match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
             Arc::clone(&state.config),
             &agent_alias,
             Some(&session_cwd),
@@ -757,6 +784,7 @@ async fn handle_socket(
             state.sop_engine.clone(),
             state.sop_audit.clone(),
             Some(state.canvas_store.clone()),
+            Some(execution_capability),
         )
         .await
         {
@@ -854,6 +882,9 @@ async fn handle_socket(
             "Seeded {} channel(s) into dashboard agent session",
         );
     }
+    // Construction is complete. Keep only the generation token for future
+    // turns so an idle socket does not block agent deletion.
+    drop(construction_reservation);
 
     // Seeding happens before the connection's agent setup is complete. Forward
     // its one-shot trim outcome only after channels are registered, so restore
@@ -867,6 +898,19 @@ async fn handle_socket(
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
                 if let Some(content) = first_chat_message_content(text) {
+                    let _turn_lease =
+                        match state.reserve_agent_turn_at(agent_alias.clone(), turn_generation) {
+                            Ok(lease) => lease,
+                            Err(error) => {
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "message": error.to_string(),
+                                    "code": "AGENT_LIFECYCLE_UNAVAILABLE"
+                                });
+                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                return;
+                            }
+                        };
                     let _session_guard = match state.session_queue.acquire(&session_key).await {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -1040,6 +1084,21 @@ async fn handle_socket(
                     let _ = sender.send(Message::Text(err.to_string().into())).await;
                     continue;
                 }
+
+                let _turn_lease = match state
+                    .reserve_agent_turn_at(agent_alias.clone(), turn_generation)
+                {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": error.to_string(),
+                            "code": "AGENT_LIFECYCLE_UNAVAILABLE"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    }
+                };
 
                 // Acquire session lock to serialize concurrent turns
                 let _session_guard = match state.session_queue.acquire(&session_key).await {
@@ -5522,7 +5581,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             v.get("model_context_window").is_none(),
             "done-frame must omit model_context_window on same-profile fallback"
         );
-        assert_eq!(v["max_context_tokens"], 32_000);
+        assert_eq!(
+            v["max_context_tokens"], 800_000,
+            "the explicit profile budget survives the same-profile fallback (#10068)"
+        );
         assert_eq!(v["last_serving_model"], "model-b");
     }
 
