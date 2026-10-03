@@ -30,7 +30,7 @@ pub fn sanitize_session_key(key: &str) -> String {
 /// `sanitize_session_key`). Equivalent to `sanitize_session_key(key) == key`
 /// but allocation-free.
 ///
-/// Client-facing entry points (the chat-completions endpoint and the
+/// Client-facing entry points (persistent RPC Chat and the gateway
 /// WebSocket handshake) reject noncanonical keys instead of silently
 /// folding them: because `sanitize_session_key` maps every disallowed
 /// character to `_`, distinct raw keys such as `alpha.beta` and `alpha/beta`
@@ -90,6 +90,16 @@ mod tests {
     fn preserves_unicode_alphanumeric() {
         // is_alphanumeric() treats unicode letters/digits as alphanumeric.
         assert_eq!(sanitize_session_key("user_Алиса"), "user_Алиса");
+    }
+
+    #[test]
+    fn replaces_path_separator_characters() {
+        // `sanitize_session_key` still builds JSONL filenames, so a raw key
+        // containing path separators must never escape the sessions directory.
+        assert_eq!(
+            sanitize_session_key("../tenant\\user/channel"),
+            "___tenant_user_channel"
+        );
     }
 
     #[test]

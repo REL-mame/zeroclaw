@@ -109,9 +109,10 @@ pub fn handle(
 /// this module) can drive the helper without going through the CLI
 /// argument parser. The CLI `handle` short-circuits at entry on
 /// `!backend.supports_atomic_claim()` and refuses to run, so the
-/// `Err(Unsupported)` fallback in this helper is **not** reachable
-/// from the CLI. It exists for direct callers that want a best-effort
-/// read-then-write on backends without atomic claim support.
+/// `Err(Unsupported)` branch in this helper is **not** reachable from
+/// the CLI. It stays fail-closed for direct callers too: the error is
+/// propagated rather than degraded into a non-atomic read-then-write,
+/// which would leave a window for a concurrent owner to be overwritten.
 pub(crate) fn claim_session_ownership(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     key: &str,

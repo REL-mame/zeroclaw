@@ -1654,13 +1654,14 @@ impl SessionBackend for SqliteSessionBackend {
                     return Ok(ClaimOutcome::NeedsMigration);
                 }
                 // Empty new session. Insert the row if missing, and set the
-                // owner only when the row is still ownerless AND still carries
-                // no transcript. The WHERE guard re-checks both conditions in
-                // the same statement the owner is written, so a concurrent
-                // append (a first message arriving under an independent
-                // connection after the probe above) can never be silently
-                // claimed — the write either lands atomically with its
-                // preconditions or is skipped.
+                // owner only when the row is still ownerless. The `WHERE`
+                // clause applies to the `ON CONFLICT DO UPDATE` branch alone,
+                // so it re-checks the ownerless-and-no-transcript preconditions
+                // for an existing metadata row in the same statement the owner
+                // is written. A fresh `INSERT` conflicts with nothing and
+                // carries no history predicate of its own: an append that
+                // creates the row concurrently is caught by the re-read below,
+                // which reports the conflict instead of silently claiming it.
                 let now = Utc::now().to_rfc3339();
                 let affected = conn
                     .execute(

@@ -253,38 +253,37 @@ pub trait SessionBackend: Send + Sync {
         Ok(None)
     }
 
-    /// Record the agent alias that owns a session. Called on WebSocket
-    /// handshake and HTTP chat-completions session-load when the alias is known.
+    /// Record the agent alias that owns a session.
+    ///
+    /// This is the unconditional setter. Persistent RPC Chat and gateway
+    /// WebSocket admission do not call it: they go through
+    /// `claim_session_agent_alias`, which records an owner only when none
+    /// exists and refuses a session that another alias owns. The setter stays
+    /// on the trait for trusted callers that must overwrite a recorded owner.
     ///
     /// # Compatibility note for custom backends
     ///
-    /// The default implementation returns `Unsupported`, which causes the
-    /// gateway handlers to:
-    ///
-    /// - **Any session (new or existing):** The handler fails closed — the
-    ///   request is rejected with `BACKEND_UNSUPPORTED_OWNERSHIP` regardless of
-    ///   whether the session is empty or carries prior data. A backend that
-    ///   does not record ownership cannot safely enforce cross-agent isolation
-    ///   for any session resumed through it, so such sessions stay **unusable**
-    ///   until the backend implements this method.
+    /// The default implementation returns `Unsupported`. No admission path
+    /// depends on this method, so a backend that leaves it unimplemented still
+    /// admits sessions correctly as long as it implements
+    /// `claim_session_agent_alias`; ownership is enforced by the claim, not by
+    /// this setter.
     ///
     /// # Data model contract
     ///
     /// `agent_alias` is a string that identifies the owning agent. It
     /// corresponds to the key in `config.agents` (the `[agents.<alias>]`
-    /// TOML section name). The alias is written once on first access and
-    /// not changed thereafter (except via `clear_agent_attribution` /
-    /// `rename_agent_attribution`).
+    /// TOML section name). Admission records it once, on the claim that first
+    /// attaches an owner; later changes go through
+    /// `clear_agent_attribution` / `rename_agent_attribution`.
     ///
     /// # Migration path for existing backends
     ///
     /// Backends with session data from before these methods were introduced
-    /// must backfill `agent_alias` metadata. Returning `Ok(None)` will NOT
-    /// allow the first caller to claim ownership of a non-empty session
-    /// (the handler returns HTTP 400).
-    ///
-    /// Single-agent deployments may implement this as a no-op returning
-    /// `Ok(())` to avoid the 400 rejection.
+    /// must backfill `agent_alias` metadata. That is what
+    /// `adopt_session_agent_alias` (reached through
+    /// `zeroclaw migrate session-ownership`) does; admission never adopts an
+    /// ownerless history implicitly.
     fn set_session_agent_alias(
         &self,
         _session_key: &str,
@@ -317,22 +316,27 @@ pub trait SessionBackend: Send + Sync {
     ///   already carries transcript history. The handler MUST refuse to load
     ///   history; the only path allowed to attach ownership in this state is
     ///   the trusted migration CLI, via `adopt_session_agent_alias`.
-    /// - `Err(Unsupported)` — backend does not track ownership. All transports
-    ///   fail closed: empty and non-empty sessions are both rejected, since an
-    ///   unowned identity cannot be safely resumed.
+    /// - `Err(Unsupported)` — backend does not track ownership. Persistent RPC
+    ///   Chat and gateway WebSocket admission fail closed: empty and non-empty
+    ///   sessions are both rejected, since an unowned identity cannot be safely
+    ///   resumed.
     ///
     /// Returns `Err(Unsupported)` by default. Third-party backends that want
-    /// cross-agent session isolation **must** override this method with an
-    /// atomic compare-and-set (JSONL: claim-lock-guarded read+write;
-    /// SQLite: INSERT … ON CONFLICT DO UPDATE … WHERE agent_alias IS NULL).
+    /// cross-agent session isolation **must** override this method with a
+    /// compare-and-set that reads and writes under one lock (SQLite does this
+    /// with `INSERT … ON CONFLICT DO UPDATE … WHERE agent_alias IS NULL`). The
+    /// trait default is not a usable implementation: the repository's JSONL
+    /// session store does not override it, so admission over that backend
+    /// refuses rather than claiming ownership it cannot enforce.
     ///
-    /// Returning `Unsupported` tells the handler the backend cannot enforce
-    /// ownership. All transports (HTTP / RPC / WebSocket) fail closed on such
-    /// a backend: even an empty session is rejected, because resuming an
-    /// unowned identity — persistent or request-scoped — would reintroduce the
-    /// same cross-agent isolation gap the ownership model exists to close. The
-    /// migration CLI refuses to enter the claim path on an unsupported backend
-    /// entirely (see `cli-migrate-session-ownership-err-backend-unsupported`).
+    /// Returning `Unsupported` tells the caller the backend cannot enforce
+    /// ownership. Persistent RPC Chat and gateway WebSocket admission fail
+    /// closed on such a backend: even an empty session is rejected, because
+    /// resuming an unowned identity — persistent or request-scoped — would
+    /// reintroduce the same cross-agent isolation gap the ownership model
+    /// exists to close. The migration CLI refuses to enter the claim path on
+    /// an unsupported backend entirely (see
+    /// `cli-migrate-session-ownership-err-backend-unsupported`).
     fn claim_session_agent_alias(
         &self,
         _session_key: &str,
@@ -392,36 +396,28 @@ pub trait SessionBackend: Send + Sync {
 
     /// Get the agent alias associated with a session, if recorded.
     ///
+    /// A read-only accessor for inspection and tooling. Ownership admission is
+    /// decided by `claim_session_agent_alias`, not by this method; the
+    /// migration CLI uses it to report recorded owners.
+    ///
     /// # Compatibility note for custom backends
     ///
-    /// The default implementation returns `Unsupported`, which causes the
-    /// gateway handlers to:
-    ///
-    /// - **Empty sessions (new):** Silently accept the turn. No ownership
-    ///   enforcement applies.
-    /// - **Non-empty sessions (existing data):** The handler returns HTTP 400
-    ///   (`"Cannot resume session: backend does not track agent ownership"`).
-    ///   Sessions with prior data become **unusable** until the backend
-    ///   implements this method.
+    /// The default implementation returns `Unsupported`. No admission path
+    /// consults this method, so leaving it unimplemented does not change
+    /// whether sessions are admitted; implement it when tooling must report
+    /// the recorded owner.
     ///
     /// # Data model contract
     ///
     /// Returns `Ok(Some(alias))` if the session has a recorded owner,
     /// `Ok(None)` if the session exists but has no recorded owner, or
     /// `Err(Unsupported)` if the backend lacks ownership tracking.
-    /// Returning `Ok(None)` tells the handler the session has no recorded
-    /// owner, which is accepted for **empty** sessions but rejected for
-    /// **non-empty** sessions (to prevent cross-agent history leakage).
     ///
     /// # Migration path for existing backends
     ///
     /// Backends with pre-existing session data must backfill `agent_alias`
-    /// metadata. Returning `Ok(None)` for a non-empty session is rejected
-    /// (HTTP 400) -- backfill is the only supported migration path.
-    ///
-    /// For single-agent deployments, return `Ok(Some(agent_alias))` to
-    /// avoid the 400 rejection. `Ok(None)` will be rejected for non-empty
-    /// sessions.
+    /// metadata through `adopt_session_agent_alias`; admission never adopts an
+    /// ownerless history implicitly.
     fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

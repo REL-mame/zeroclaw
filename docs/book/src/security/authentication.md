@@ -553,8 +553,14 @@ unowned session that already has history rather than silently adopting it.
 Those ownerless histories are adopted deliberately, with an explicit target
 agent, by `zeroclaw migrate session-ownership`. Session ids are also required
 to be canonical before chat ownership admission or transcript restoration, so
-a display id can never collapse onto another session's key. A backend that
-cannot enforce the claim (raw JSONL)
+a display id can never collapse onto another session's key. That rule reaches
+existing sessions too: a gateway session whose display id is not canonical, for
+example one containing a dot, can no longer be resumed over the WebSocket, and
+reconnecting with that id is refused with `INVALID_SESSION_ID` before the
+session is reached. Nothing re-keys stored sessions, so the transcript is left
+on disk untouched and stops being reachable through admission; recovering it
+means reading the stored history directly rather than re-keying it. A backend
+that cannot enforce the claim (raw JSONL)
 is refused for every caller on these paths, empty and non-empty sessions alike,
 rather than admitting a session whose owner cannot outlive the process. With
 the configured SQLite default, the factory imports legacy JSONL history on
