@@ -9120,8 +9120,8 @@ data: [DONE]\n\n";
     /// client left it) can no longer be resumed over the WebSocket. The
     /// connection is refused with `INVALID_SESSION_ID` before any claim, and the
     /// stored transcript is left exactly as it is. Nothing re-keys stored
-    /// sessions, so such a history stays on disk until an operator migrates it
-    /// deliberately.
+    /// sessions, so such a history stays on disk unreachable over the WebSocket
+    /// until an operator re-imports it under a canonical id.
     #[test]
     fn websocket_refuses_seeded_legacy_dotted_session_transcript() {
         std::thread::Builder::new()

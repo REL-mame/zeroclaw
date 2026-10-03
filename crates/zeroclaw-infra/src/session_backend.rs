@@ -73,9 +73,10 @@ pub struct TimestampedMessage {
 ///
 /// The claim is a compare-and-set performed inside the backend's own lock so
 /// that concurrent callers cannot both believe they own the session. This is
-/// the fail-closed invariant used before any history load across HTTP, RPC,
-/// and the WebSocket handshake — replacing the previous "get then set" pattern
-/// where a caller could overwrite the owner between the read and the write.
+/// the fail-closed invariant used before any history load across persistent
+/// RPC Chat and the gateway WebSocket handshake — replacing the previous
+/// "get then set" pattern where a caller could overwrite the owner between
+/// the read and the write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimOutcome {
     /// The session had no recorded owner and this alias is now recorded as

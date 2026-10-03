@@ -1642,7 +1642,7 @@ impl SessionBackend for SqliteSessionBackend {
                 // first claimant would silently read another agent's history.
                 // Return `NeedsMigration` so the handler refuses to load and
                 // the trusted migration CLI can adopt via
-                // `set_session_agent_alias` after operator preflight.
+                // `adopt_session_agent_alias` after operator preflight.
                 let has_history: bool = conn
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_key = ?1)",
