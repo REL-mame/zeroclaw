@@ -280,15 +280,19 @@ fn gate_ws_session_claim(
 struct WsStarted {
     session_key: String,
     stored_messages: Vec<zeroclaw_api::model_provider::ChatMessage>,
+    /// The alias generation the handshake's ownership claim ran under. The
+    /// socket refuses to build or run if that alias is replaced first.
+    handshake_generation: u64,
 }
 
 /// Starts a WS session: atomic ownership claim, history load, name resolution,
 /// then the `session_start` greeting, in that order. Returns the transcript
-/// state the caller needs to restore. The claim runs before any history load
-/// so a caller-controlled id can never reassign an owner and read another
-/// agent's transcript (`gate_ws_session_claim` fails closed for cross-agent
-/// and ownerless-non-empty cases). The greeting is sent unconditionally here
-/// — before the first client frame is read — so a client never has to send
+/// state the caller needs to restore, together with the alias generation the
+/// claim ran under. The claim runs before any history load so a
+/// caller-controlled id can never reassign an owner and read another agent's
+/// transcript (`gate_ws_session_claim` fails closed for cross-agent and
+/// ownerless-non-empty cases). The greeting is sent unconditionally here —
+/// before the first client frame is read — so a client never has to send
 /// anything to receive its session identity.
 async fn send_ws_session_start<S>(
     sender: &mut S,
@@ -301,6 +305,11 @@ where
     S: SinkExt<Message> + Unpin,
 {
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    // Pin the alias incarnation the claim below decides under. A committed
+    // delete or rename advances the generation, so a socket that waited for its
+    // first frame across such a change can be refused before it restores or
+    // runs a transcript it loaded under the previous incarnation.
+    let handshake_generation = state.agent_lifecycle.alias_generation(agent_alias);
     let mut resumed = false;
     let mut message_count = 0usize;
     let mut stored_messages = Vec::new();
@@ -359,6 +368,7 @@ where
     Ok(WsStarted {
         session_key,
         stored_messages,
+        handshake_generation,
     })
 }
 
@@ -728,6 +738,7 @@ async fn handle_socket(
     }
     let session_key = hs.session_key;
     let stored_messages = hs.stored_messages;
+    let handshake_generation = hs.handshake_generation;
     let memory_session_id = zeroclaw_api::session_keys::canonical_memory_id(&session_id);
 
     // Reserve this alias generation for construction so a concurrent delete
@@ -748,6 +759,22 @@ async fn handle_socket(
             }
         };
     let turn_generation = state.agent_lifecycle.alias_generation(&agent_alias);
+    // The handshake claimed the session and loaded its transcript under
+    // `handshake_generation`. A delete or rename that committed while this
+    // socket waited for its first frame advances the generation and leaves the
+    // stored transcript in place, so the transcript and the ownership this
+    // connection holds belong to the previous incarnation of the alias. Refuse
+    // rather than let the replacement agent inherit them; the reservation above
+    // fences the alias until this returns.
+    if turn_generation != handshake_generation {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": "the agent for this session was replaced while the connection was opening",
+            "code": "AGENT_REPLACED"
+        });
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return;
+    }
 
     let session_cwd = match resolve_ws_session_cwd(requested_cwd.as_deref(), &config, &agent_alias)
     {

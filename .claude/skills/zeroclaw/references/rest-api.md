@@ -176,7 +176,11 @@ Streaming agent chat over WebSocket.
 ```
 The greeting is pushed as soon as the connection is up. Its `session_id` is
 the `session_id` query parameter when supplied, otherwise a UUID minted by the
-gateway. This identity is fixed for the life of the connection.
+gateway. This identity is fixed for the life of the connection. The greeting
+also fixes the agent incarnation the connection runs under: if that agent is
+deleted (and possibly recreated) or renamed before the first client frame, the
+connection is refused with `AGENT_REPLACED` instead of restoring the previous
+incarnation's stored transcript into the replacement agent.
 
 **Client → Server (optional):**
 ```json

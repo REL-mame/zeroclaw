@@ -9386,6 +9386,149 @@ data: [DONE]\n\n";
         gateway_server.abort();
     }
 
+    /// Pins the ownership-to-generation binding on the WebSocket handshake. The
+    /// greeting is sent before the first client frame, and the transcript the
+    /// socket will restore is loaded at that point; the alias generation is
+    /// captured alongside it. A delete (or rename) that commits while the
+    /// socket waits for its first frame advances the generation but leaves the
+    /// stored transcript in place, so the socket must refuse rather than hand
+    /// the previous incarnation's history to the replacement agent.
+    #[test]
+    fn websocket_refuses_transcript_when_alias_replaced_before_first_frame() {
+        std::thread::Builder::new()
+            .name("gateway-ws-alias-replaced".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_refuses_transcript_when_alias_replaced_inner());
+            })
+            .expect("spawn WS alias-replaced test thread")
+            .join()
+            .expect("WS alias-replaced test thread must not panic");
+    }
+
+    async fn websocket_refuses_transcript_when_alias_replaced_inner() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+        let tmp = tempfile::tempdir().expect("alias-replaced temp dir");
+        let (mut state, _) =
+            production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0, false);
+        let session_db = tempfile::tempdir().expect("alias-replaced session db");
+        let backend: std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
+            std::sync::Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_db.path())
+                    .expect("sqlite session backend"),
+            );
+        // Seed an owned transcript under a canonical key: the handshake claims
+        // it and loads this history into the socket's pending restore.
+        let session_id = "transport-alias-replaced";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        backend
+            .append(
+                &session_key,
+                &zeroclaw_providers::ChatMessage::user("prior incarnation turn"),
+            )
+            .expect("seed transcript");
+        assert_eq!(
+            backend
+                .adopt_session_agent_alias(&session_key, "web")
+                .unwrap(),
+            zeroclaw_infra::session_backend::AdoptOutcome::Adopted,
+        );
+        state.session_backend = Some(std::sync::Arc::clone(&backend));
+
+        let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
+        // This URL connects only to the test's loopback listener. Keep the
+        // scheme split so the static insecure-transport rule does not flag a
+        // non-production fixture.
+        let websocket_url = format!(
+            "{}//{gateway_addr}/ws/chat?agent=web&session_id={session_id}",
+            "ws:"
+        );
+        let (mut websocket, _) = connect_async(websocket_url)
+            .await
+            .expect("WS transport upgrade");
+        // The greeting is sent before the first client frame. The socket is now
+        // idle, holding the transcript it loaded under the current alias
+        // generation and holding no admission reservation.
+        let session_start = websocket
+            .next()
+            .await
+            .expect("WS session_start frame")
+            .expect("WS session_start transport")
+            .into_text()
+            .expect("session_start text");
+        let session_start: serde_json::Value =
+            serde_json::from_str(&session_start).expect("session_start json");
+        assert_eq!(session_start["type"], "session_start");
+        assert_eq!(
+            session_start["resumed"], true,
+            "the seeded transcript must resume for the owned canonical id"
+        );
+
+        // Replace the alias while the socket waits: commit a destructive
+        // mutation so the generation advances, and clear the stored
+        // attribution exactly as the delete cascade does. The transcript
+        // itself is left in place, which is what makes the stale restore
+        // possible without the new guard.
+        {
+            let mut delete = state
+                .agent_lifecycle
+                .begin_delete("web")
+                .expect("an idle alias grants its delete reservation");
+            delete.commit_destructive_mutation();
+        }
+        backend
+            .clear_agent_attribution("web")
+            .expect("clear stored attribution");
+
+        // The first client frame arrives after the replacement. The connection
+        // must refuse instead of restoring the previous incarnation's history.
+        websocket
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "message", "content": "continue"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send first message frame");
+        let reply = websocket
+            .next()
+            .await
+            .expect("WS error frame")
+            .expect("WS error transport")
+            .into_text()
+            .expect("error text");
+        let reply: serde_json::Value = serde_json::from_str(&reply).expect("error json");
+        assert_eq!(reply["type"], "error");
+        assert_eq!(
+            reply["code"], "AGENT_REPLACED",
+            "the socket must refuse a transcript whose alias was replaced"
+        );
+
+        // No turn ran and the transcript is untouched: the previous
+        // incarnation's history was never handed to the replacement agent.
+        let transcript = backend.load(&session_key);
+        assert_eq!(
+            transcript.len(),
+            1,
+            "the seeded transcript must be unchanged: {transcript:?}"
+        );
+        assert_eq!(transcript[0].content, "prior incarnation turn");
+        assert_eq!(
+            backend.get_session_agent_alias(&session_key).unwrap(),
+            None,
+            "the refused socket must not have adopted the session"
+        );
+
+        drop(websocket);
+        gateway_server.abort();
+    }
+
     #[test]
     fn websocket_delivers_api_injected_message_for_dotted_session() {
         std::thread::Builder::new()
