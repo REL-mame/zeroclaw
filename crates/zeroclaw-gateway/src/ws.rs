@@ -220,14 +220,16 @@ pub async fn handle_ws_chat(
 ///
 /// On success returns `Ok(())` (ownership claimed); on failure returns
 /// the JSON error frame the caller should write back before closing.
+///
+/// The id is the connection's already-resolved identity — the query value, or
+/// the UUID minted during the handshake when the query omits one — so the gate
+/// never has to invent a key the caller would not use.
 fn gate_ws_session_claim(
-    explicit_session_id: Option<&str>,
+    session_id: &str,
     agent_alias: &str,
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
 ) -> Result<(), serde_json::Value> {
-    if let Some(sid) = explicit_session_id
-        && !zeroclaw_api::session_keys::is_canonical_session_key(sid)
-    {
+    if !zeroclaw_api::session_keys::is_canonical_session_key(session_id) {
         return Err(serde_json::json!({
             "type": "error",
             "code": "INVALID_SESSION_ID",
@@ -235,9 +237,7 @@ fn gate_ws_session_claim(
                 "session_id must contain only [A-Za-z0-9_-] and be non-empty",
         }));
     }
-    let session_key = explicit_session_id
-        .map(|id| format!("{GW_SESSION_PREFIX}{id}"))
-        .unwrap_or_else(|| format!("{GW_SESSION_PREFIX}{}", uuid::Uuid::new_v4()));
+    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
     match backend.claim_session_agent_alias(&session_key, agent_alias) {
         Ok(zeroclaw_infra::session_backend::ClaimOutcome::Claimed) => Ok(()),
         Ok(zeroclaw_infra::session_backend::ClaimOutcome::Conflict(owner)) => {
@@ -258,8 +258,8 @@ fn gate_ws_session_claim(
                      history; run `migrate session-ownership` to adopt",
             }))
         }
-        // Backend without ownership tracking: fail closed across all
-        // transports (WS / HTTP / RPC). Even an empty session is rejected —
+        // Backend without ownership tracking: fail closed on both admission
+        // paths (WS and RPC). Even an empty session is rejected —
         // a persistent connection under such a backend cannot safely adopt
         // an unowned identity, so accepting it would carry the same
         // cross-agent isolation gap for any session resumed over it.
@@ -315,7 +315,7 @@ where
     let mut stored_messages = Vec::new();
     let mut effective_name: Option<String> = None;
     if let Some(ref backend) = state.session_backend {
-        gate_ws_session_claim(Some(session_id), agent_alias, backend.as_ref())?;
+        gate_ws_session_claim(session_id, agent_alias, backend.as_ref())?;
         // An unreadable transcript must not become an empty session that a
         // later turn persists over the existing history.
         let messages = match backend.try_load(&session_key) {
@@ -562,7 +562,7 @@ async fn handle_socket(
 
     // Run the canonical-key + atomic-ownership-claim gate before
     // any history load. The gate is mandatory whenever a session
-    // backend is configured (mirroring HTTP and RPC) so a
+    // backend is configured (mirroring RPC) so a
     // caller-supplied session id can never reassign the owner of an
     // existing session and then read another agent's transcript.
     // Canonical-identity check enforced before the backend branch forks. The
@@ -6023,7 +6023,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     #[test]
     fn gate_rejects_noncanonical_explicit_session_id() {
         let backend = FakeBackend::new();
-        let err = gate_ws_session_claim(Some("alpha.beta"), "default", &backend)
+        let err = gate_ws_session_claim("alpha.beta", "default", &backend)
             .expect_err("non-canonical session id must be rejected");
         assert_eq!(err_code(&err), "INVALID_SESSION_ID");
         assert_eq!(
@@ -6047,7 +6047,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             "alpha@beta",
         ] {
             let backend = FakeBackend::new();
-            let err = gate_ws_session_claim(Some(raw), "default", &backend)
+            let err = gate_ws_session_claim(raw, "default", &backend)
                 .expect_err(&format!("{raw:?} should be rejected"));
             assert_eq!(
                 err_code(&err),
@@ -6060,7 +6060,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     #[test]
     fn gate_accepts_canonical_explicit_session_id() {
         let backend = FakeBackend::new();
-        gate_ws_session_claim(Some("abc-DEF_123"), "default", &backend)
+        gate_ws_session_claim("abc-DEF_123", "default", &backend)
             .expect("canonical session id must be accepted");
         assert_eq!(
             backend.get_session_agent_alias("gw_abc-DEF_123").unwrap(),
@@ -6108,28 +6108,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
     }
     #[test]
-    fn gate_mints_uuid_when_no_explicit_session_id() {
-        let backend = FakeBackend::new();
-        gate_ws_session_claim(None, "default", &backend)
-            .expect("no explicit id must mint a UUID and claim");
-        // Exactly one UUID-shaped session is minted on the backend.
-        let keys = backend.list_sessions();
-        assert_eq!(keys.len(), 1, "mint must claim a single session");
-        let key = keys.into_iter().next().unwrap();
-        assert!(key.starts_with("gw_"));
-        let sid = key.trim_start_matches("gw_");
-        assert_eq!(sid.len(), 36);
-        assert!(sid.chars().filter(|c| *c == '-').count() == 4);
-        assert_eq!(
-            backend.get_session_agent_alias(&key).unwrap(),
-            Some("default".to_string())
-        );
-    }
-
-    #[test]
     fn gate_conflict_when_other_agent_owns_session() {
         let backend = FakeBackend::with_owner("gw_owned", "alice");
-        let err = gate_ws_session_claim(Some("owned"), "bob", &backend)
+        let err = gate_ws_session_claim("owned", "bob", &backend)
             .expect_err("cross-agent claim must be rejected");
         assert_eq!(err_code(&err), "SESSION_OWNED_BY_OTHER_AGENT");
         let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("");
@@ -6146,14 +6127,14 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     #[test]
     fn gate_same_alias_re_claim_is_idempotent() {
         let backend = FakeBackend::with_owner("gw_owned", "default");
-        gate_ws_session_claim(Some("owned"), "default", &backend)
+        gate_ws_session_claim("owned", "default", &backend)
             .expect("the owning alias re-claiming must be a no-op success");
     }
 
     #[test]
     fn gate_needs_migration_for_ownerless_nonempty_session() {
         let backend = FakeBackend::with_ownerless_history("gw_orphan", "old message");
-        let err = gate_ws_session_claim(Some("orphan"), "default", &backend)
+        let err = gate_ws_session_claim("orphan", "default", &backend)
             .expect_err("non-empty ownerless session must be rejected");
         assert_eq!(err_code(&err), "SESSION_NEEDS_MIGRATION");
         let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("");
@@ -6167,7 +6148,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     fn gate_empty_unowned_session_is_claimed() {
         let backend = FakeBackend::new();
         // The session does not exist yet — first claim wins.
-        gate_ws_session_claim(Some("new"), "default", &backend)
+        gate_ws_session_claim("new", "default", &backend)
             .expect("a brand-new session must be claimed");
         assert_eq!(
             backend.get_session_agent_alias("gw_new").unwrap(),
@@ -6180,7 +6161,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let backend = UnsupportedClaimBackend {
             preloaded: vec![ChatMessage::user("seed")],
         };
-        let err = gate_ws_session_claim(Some("resumable"), "default", &backend)
+        let err = gate_ws_session_claim("resumable", "default", &backend)
             .expect_err("non-empty session on an unsupported backend must be rejected");
         assert_eq!(err_code(&err), "BACKEND_UNSUPPORTED_OWNERSHIP");
     }
@@ -6191,9 +6172,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             preloaded: Vec::new(),
         };
         // Fail closed: backends without ownership tracking reject even empty
-        // sessions, uniformly across all transports (WS / HTTP / RPC) — an
+        // sessions, uniformly on both admission paths (WS and RPC) — an
         // unowned identity cannot be safely resumed.
-        let err = gate_ws_session_claim(Some("new"), "default", &backend)
+        let err = gate_ws_session_claim("new", "default", &backend)
             .expect_err("even empty session on an unsupported backend must be rejected");
         assert_eq!(err_code(&err), "BACKEND_UNSUPPORTED_OWNERSHIP");
     }

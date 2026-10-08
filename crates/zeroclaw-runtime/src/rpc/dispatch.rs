@@ -619,14 +619,16 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
 
 /// Reject a caller-supplied session id that is not canonical.
 ///
-/// Every RPC method that keys the chat backend derives `rpc_{session_id}`, and
-/// the JSONL store sanitizes that into a filename — so `alpha.beta` and
-/// `alpha/beta` would collapse onto the same transcript/ownership record while
-/// the caller sees two distinct ids. Enforcing canonicality on *every* entry
-/// point that accepts a caller id keeps the persistence key injective (matching
-/// the HTTP/WS gates) and keeps the read/state/delete probes from ever
-/// addressing a collided key. Auto-generated UUIDs are always canonical, so
-/// only explicit ids are affected.
+/// Keeps the caller-facing id space identical to the WebSocket gate's. An id
+/// the gate refuses must not be creatable here instead — it would be keyed
+/// `rpc_{session_id}` and then be unresumable, since the resume path applies
+/// the same rule. It also keeps a key-folding backend from ever being handed
+/// two spellings of one session: the JSONL store sanitizes the key into a
+/// filename, so `alpha.beta` and `alpha/beta` would otherwise share one
+/// transcript and ownership record while the caller sees two ids. Every RPC
+/// method that accepts a caller id enforces this before it reads or writes
+/// state, so no probe addresses a folded key. Auto-generated UUIDs are always
+/// canonical, so only explicit ids are affected.
 fn ensure_canonical_session_id(session_id: &str) -> Result<(), JsonRpcError> {
     if zeroclaw_api::session_keys::is_canonical_session_key(session_id) {
         Ok(())
@@ -4394,6 +4396,15 @@ impl RpcDispatcher {
         create_only: Option<&parking_lot::Mutex<Option<u64>>>,
     ) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
+        // Reject a noncanonical caller-supplied id before anything reads the
+        // store with it. It must not be possible to *create* an id that the
+        // resume path and the WebSocket gate would refuse, nor to hand a
+        // key-folding backend a second spelling of an existing session (see
+        // ensure_canonical_session_id). Auto-generated UUIDs are always
+        // canonical, so this only affects explicit ids.
+        if let Some(session_id) = req.session_id.as_deref() {
+            ensure_canonical_session_id(session_id)?;
+        }
         let expected_generation = match req.session_id.as_deref() {
             Some(session_id) => self.capture_session_access(session_id).await?,
             None => None,
@@ -4428,14 +4439,6 @@ impl RpcDispatcher {
         let session_id = req
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-        // Reject noncanonical caller-supplied session ids before any backend
-        // keying or permit acquisition (see ensure_canonical_session_id).
-        // Auto-generated UUIDs are always canonical, so this only affects
-        // explicit ids.
-        if resuming {
-            ensure_canonical_session_id(&session_id)?;
-        }
 
         let admission = self
             .ctx
@@ -5169,7 +5172,7 @@ impl RpcDispatcher {
                         // Ordinary claim rejects cross-agent
                         // conflict and ownerless-nonempty (unmigrated) sessions;
                         // backends without ownership tracking fail closed
-                        // uniformly across WS / HTTP / RPC, even for empty
+                        // uniformly for WS and RPC, even for empty
                         // sessions.
                         match backend.claim_session_agent_alias(&session_key, &req.agent_alias) {
                             Ok(zeroclaw_infra::session_backend::ClaimOutcome::Claimed) => {}
@@ -6407,11 +6410,10 @@ impl RpcDispatcher {
         JsonRpcError,
     > {
         // Reject a noncanonical caller-supplied id before the session key is
-        // derived, so a dotted or otherwise noncanonical id cannot address a
-        // stored transcript under a different key. Both entry points reach the
-        // store through this shared turn body, so `session/run-once` is
-        // covered here too — it closes the transient session when this
-        // rejects, before the turn runs.
+        // derived, so a folded spelling cannot address a stored session. Both
+        // entry points reach the store through this shared turn body, so
+        // `session/run-once` is covered here too — it closes the transient
+        // session when this rejects, before the turn runs.
         ensure_canonical_session_id(&req.session_id)?;
         let sid = &req.session_id;
         let authorized = self
@@ -35471,7 +35473,7 @@ mod tests {
     }
 
     /// Noncanonical caller-supplied session ids must be rejected before any
-    /// backend keying, mirroring the HTTP/WS canonical gate — otherwise
+    /// backend keying, mirroring the WebSocket canonical gate — otherwise
     /// `alpha.beta` and `alpha/beta` would collapse to the same `rpc_*`
     /// transcript once the JSONL store sanitizes the filename.
     #[tokio::test]

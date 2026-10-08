@@ -1805,19 +1805,22 @@ impl SessionBackend for SqliteSessionBackend {
                         }
                     }
                 })();
-                match &outcome {
-                    Ok(AdoptOutcome::Adopted) => {
-                        conn.execute_batch("COMMIT")
-                            .map_err(std::io::Error::other)?;
-                    }
-                    Ok(AdoptOutcome::Conflict(_)) | Ok(AdoptOutcome::Missing) => {
+                // Close the transaction on every path without `?`: returning
+                // early here would leave it open on this shared connection, and
+                // the next writer — including a later adoption — would fail with
+                // "cannot start a transaction within a transaction".
+                let closing = match &outcome {
+                    Ok(AdoptOutcome::Adopted) => conn.execute_batch("COMMIT"),
+                    Ok(AdoptOutcome::Conflict(_)) | Ok(AdoptOutcome::Missing) | Err(_) => {
                         conn.execute_batch("ROLLBACK")
-                            .map_err(std::io::Error::other)?;
                     }
-                    Err(_) => {
-                        conn.execute_batch("ROLLBACK")
-                            .map_err(std::io::Error::other)?;
-                    }
+                };
+                if let Err(e) = closing {
+                    // A failed COMMIT leaves the adoption unapplied. Unwind so
+                    // the connection is not left inside a transaction, then
+                    // report the failure rather than a half-applied adoption.
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(std::io::Error::other(e));
                 }
                 outcome
             }

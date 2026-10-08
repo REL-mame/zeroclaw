@@ -45,13 +45,13 @@ pub fn is_canonical_session_key(key: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Canonical memory-session identifier shared by WS and HTTP paths.
+/// Canonical memory-session identifier for a client session ID.
 ///
-/// Both transports must pass the same identifier to
+/// Every entry point must pass this same identifier to
 /// `Agent::set_memory_session_id` so the memory backend sees a single
-/// scope regardless of transport. This is the sanitized form of the
-/// client-supplied session ID, matching the on-disk JSONL filename and
-/// the `session_id` column in SQLite backends.
+/// scope for one session regardless of which path reached it. This is the
+/// sanitized form of the client-supplied session ID, matching the on-disk
+/// JSONL filename and the `session_id` column in SQLite backends.
 pub fn canonical_memory_id(session_id: &str) -> String {
     sanitize_session_key(session_id)
 }
@@ -104,8 +104,8 @@ mod tests {
 
     #[test]
     fn canonical_memory_id_preserves_punctuation_key() {
-        // WS and HTTP must produce identical memory-scope identifiers for
-        // the same client session ID, including keys with punctuation.
+        // Every entry point must produce identical memory-scope identifiers
+        // for the same client session ID, including keys with punctuation.
         assert_eq!(canonical_memory_id("alpha.beta"), "alpha_beta");
         assert_eq!(canonical_memory_id("test.alpha"), "test_alpha");
         // UUID-based IDs are unaffected.

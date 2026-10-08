@@ -9530,7 +9530,7 @@ data: [DONE]\n\n";
     }
 
     #[test]
-    fn websocket_delivers_api_injected_message_for_dotted_session() {
+    fn websocket_receives_api_injected_message_keyed_by_display_id() {
         std::thread::Builder::new()
             .name("gateway-ws-api-delivery".to_string())
             .stack_size(8 * 1024 * 1024)
@@ -9539,14 +9539,14 @@ data: [DONE]\n\n";
                     .enable_all()
                     .build()
                     .expect("test runtime")
-                    .block_on(websocket_delivers_api_injected_message_inner());
+                    .block_on(websocket_receives_api_injected_message_inner());
             })
             .expect("spawn WS api-delivery test thread")
             .join()
             .expect("WS api-delivery test thread must not panic");
     }
 
-    async fn websocket_delivers_api_injected_message_inner() {
+    async fn websocket_receives_api_injected_message_inner() {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
@@ -9608,7 +9608,7 @@ data: [DONE]\n\n";
             axum::extract::Path(session_id.to_string()),
             axum::Json(
                 serde_json::from_value::<api::SessionMessagePostBody>(serde_json::json!({
-                    "content": "injected for dotted session"
+                    "content": "injected for live session"
                 }))
                 .expect("body should deserialize"),
             ),
@@ -9630,7 +9630,7 @@ data: [DONE]\n\n";
             event["session_id"], session_id,
             "API broadcasts must carry the display id the socket filters on"
         );
-        assert_eq!(event["content"], "injected for dotted session");
+        assert_eq!(event["content"], "injected for live session");
 
         drop(websocket);
         gateway_server.abort();
