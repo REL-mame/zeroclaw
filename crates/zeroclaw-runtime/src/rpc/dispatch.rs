@@ -6387,10 +6387,6 @@ impl RpcDispatcher {
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
         let req: SessionPromptParams = parse_params(params)?;
-        // Reject noncanonical caller-supplied ids before the session key is
-        // derived, so a dotted or otherwise noncanonical id cannot address a
-        // stored transcript under a different key.
-        ensure_canonical_session_id(&req.session_id)?;
         let (result, _usage) = self.run_session_prompt(req, None).await?;
         to_result(result)
     }
@@ -6410,6 +6406,13 @@ impl RpcDispatcher {
         ),
         JsonRpcError,
     > {
+        // Reject a noncanonical caller-supplied id before the session key is
+        // derived, so a dotted or otherwise noncanonical id cannot address a
+        // stored transcript under a different key. Both entry points reach the
+        // store through this shared turn body, so `session/run-once` is
+        // covered here too — it closes the transient session when this
+        // rejects, before the turn runs.
+        ensure_canonical_session_id(&req.session_id)?;
         let sid = &req.session_id;
         let authorized = self
             .authorize_session_owner(sid, Method::SessionPrompt)
